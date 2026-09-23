@@ -4,7 +4,8 @@
  （polyling_motion_studio.html が <script src> で読む）
 --------------------------------------------------------------------------------
  PolyLing の「ライブ受信」が画面向けに配信する WebSocket（既定 ws://localhost:12361/）を受ける。
- PolyLing は UDP でマッスルを受け取るたびに、つながっている画面へ送ってくる。
+ PolyLing は送る側（mocopi 受信アプリ）からマッスルを受け取るたびに、同じポートにつながっている
+ 画面へ転送してくる（前の送信が終わっていない画面へは、そのフレームを送らない）。
  こちらからは何も送らない（受信開始＝接続するだけ）。
 
  封筒（PolyLing の WebSocket 部品 com.haglib.net_duplexchannel の形式。RemoteHtmlClient.cs と同じ開き方）
