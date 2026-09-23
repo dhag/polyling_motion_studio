@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+ ボーン編集  bone_editor.html   （motion_studio.html の上半分に読み込まれる）
+--------------------------------------------------------------------------------
+ 役割: 骨格を表示し、ボーンを回して姿勢を作る。単独で開いても使える。
+ 外側とのやり取り（このファイル末尾の <script> で行う。一覧は motion_studio.html の先頭）
+   送る : {from:'bone', ready:true} / {from:'bone', payload:{type:'pose', …}}
+          （WebSocket 送信 cwsSend をそのまま外側にも流している）
+   受ける: {to:'bone', command:'auto'|'apply'|'reset'} / {to:'bone', payload:{type:'state'|'pose'|'skeleton'}}
+================================================================================
+-->
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>クオータニオン・4×4行列とボーン親子関係 デモ</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1b2230; --line:#2b3444;
+    --txt:#c9d4e3; --txt2:#8492a6; --accent:#4fc3f7; --rot:#7fd17f; --pos:#f0a35e;
+    --x:#ff6b6b; --y:#7fd17f; --z:#5b8dff; --sel:#ffd166;
+    --mono:"SFMono-Regular",Consolas,"Roboto Mono",monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,system-ui,sans-serif;font-size:13px;}
+  #app{display:flex;height:100vh;overflow:hidden;}
+  #left{flex:1 1 56%;display:flex;flex-direction:column;border-right:1px solid var(--line);min-width:380px;}
+  #right{flex:1 1 44%;overflow-y:auto;padding:10px 12px 40px;min-width:340px;}
+  header{padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel);}
+  header h1{margin:0;font-size:14px;font-weight:600;letter-spacing:.02em;}
+  header p{margin:3px 0 0;font-size:11px;color:var(--txt2);}
+  #viewWrap{position:relative;flex:1;}
+  canvas{display:block;width:100%;height:100%;cursor:grab;}
+  canvas:active{cursor:grabbing;}
+  #viewbar{position:absolute;top:8px;left:8px;display:flex;gap:6px;flex-wrap:wrap;}
+  #viewbar button,.tb{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+    border-radius:5px;padding:4px 9px;font-size:11px;cursor:pointer;}
+  #viewbar button:hover{border-color:var(--accent);}
+  #viewbar button.on{border-color:var(--accent);color:var(--accent);}
+  .vctl{display:flex;align-items:center;gap:5px;background:var(--panel2);border:1px solid var(--line);
+    border-radius:5px;padding:2px 8px;}
+  .vlab{font-size:10px;color:var(--txt2);white-space:nowrap;}
+  .vslider{width:96px;accent-color:var(--accent);cursor:pointer;}
+  #hint{position:absolute;bottom:8px;left:8px;font-size:10px;color:var(--txt2);}
+  /* ===== 協働バー ===== */
+  #collab{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 14px;
+    border-bottom:1px solid var(--line);background:var(--panel2);font-size:11px;}
+  #collab .lbl{color:var(--txt2);}
+  #collab input{font-family:var(--mono);font-size:11px;color:var(--txt);background:var(--bg);
+    border:1px solid var(--line);border-radius:5px;padding:4px 7px;outline:none;}
+  #collab input:focus{border-color:var(--accent);}
+  #collab input.cid{width:64px;text-align:center;color:var(--accent);letter-spacing:.5px;}
+  #collab input.curl{width:210px;}
+  #collab button{background:var(--panel);color:var(--txt);border:1px solid var(--line);
+    border-radius:5px;padding:4px 10px;font-size:11px;cursor:pointer;}
+  #collab button:hover{border-color:var(--accent);}
+  #collab .dot{font-size:12px;color:var(--txt2);}
+  #collab .frame{margin-left:auto;color:var(--txt2);font-family:var(--mono);}
+  #collab .frame b{color:var(--sel);font-size:13px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px;}
+  .card h2{margin:0 0 8px;font-size:12px;font-weight:600;color:var(--accent);letter-spacing:.03em;
+    display:flex;align-items:center;gap:8px;}
+  .card h2 .tag{font-weight:400;color:var(--txt2);font-size:10px;}
+  .editTabs{display:flex;gap:4px;margin-bottom:8px;}
+  .editTabs.finger{flex-wrap:wrap;}
+  .hpCheck{display:block;font-size:12px;color:var(--txt2);margin:2px 0 4px;}
+  .hpSignHead{font-size:11px;color:var(--txt2);margin:6px 0 2px;}
+  #handPoseBox .slrow{grid-template-columns:64px 1fr 44px;}   /* 手のスライダ：名前 | つまみ | 値 */
+  .hpLab{font-size:12px;color:var(--txt2);white-space:nowrap;}
+  #handPoseBox{margin-bottom:8px;}
+  .hpDetails{font-size:11px;color:var(--txt2);margin-top:4px;}
+  .hpDetails table{border-collapse:collapse;margin-top:4px;}
+  .hpDetails > div{overflow-x:auto;}
+  .hpDetails td,.hpDetails th{padding:1px 3px;text-align:center;font-weight:normal;}
+  .hpDetails input{width:38px;background:var(--panel2);border:1px solid var(--line);color:var(--txt);font-size:11px;text-align:right;}                       /* 指モード：1 行に 1 本の指（3 節） */
+  .editTabs.finger button{flex:0 0 calc(33.333% - 3px);}
+  .editTabs button{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--txt2);
+    border-radius:5px;padding:5px;font-size:11px;cursor:pointer;}
+  .editTabs button.on{color:var(--bg);background:var(--sel);border-color:var(--sel);font-weight:600;}
+  .slrow{display:grid;grid-template-columns:18px 1fr 60px 30px;align-items:center;gap:8px;margin:5px 0;}
+  .slrow .ax{font-weight:700;text-align:center;font-family:var(--mono);}
+  .slrow .ax.X{color:var(--x);} .slrow .ax.Y{color:var(--y);} .slrow .ax.Z{color:var(--z);}
+  .slrow input[type=range]{width:100%;}
+  .slrow .num{font-family:var(--mono);text-align:right;font-size:12px;}
+  .slrow .unit{color:var(--txt2);font-size:10px;}
+  .resetbtn{margin-top:6px;}
+  .modeRow{display:flex;gap:6px;align-items:center;margin-bottom:8px;font-size:11px;color:var(--txt2);}
+  .modeBtn{background:var(--panel2);border:1px solid var(--line);color:var(--txt2);
+    border-radius:5px;padding:4px 10px;font-size:11px;cursor:pointer;}
+  .modeBtn:hover{border-color:var(--accent);}
+  .modeBtn.on{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600;}
+  #allBoneRow{margin-bottom:8px;}
+  #allBoneRow select{width:100%;}
+  .subLab{font-size:10px;color:var(--pos);margin:10px 0 2px;font-weight:600;letter-spacing:.02em;
+    border-top:1px dashed var(--line);padding-top:8px;}
+  .btnRow{display:flex;gap:6px;margin-top:6px;}
+  .btnRow .tb{flex:1;margin-top:0;}
+  .matrix{font-family:var(--mono);font-size:11.5px;border-collapse:collapse;margin:4px 0;}
+  .matrix td{padding:2px 7px;text-align:right;border:1px solid transparent;min-width:54px;}
+  .matrix td.r{color:var(--rot);} .matrix td.t{color:var(--pos);} .matrix td.b{color:var(--txt2);}
+  .qbox{font-family:var(--mono);font-size:12.5px;display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;}
+  .qbox .qc{color:var(--accent);} .qbox .lab{color:var(--txt2);font-size:10px;}
+  .selname{color:var(--sel);font-weight:600;}
+  .legend{font-size:10px;color:var(--txt2);margin-top:4px;}
+  .legend .r{color:var(--rot);} .legend .t{color:var(--pos);}
+  .chain{font-family:var(--mono);font-size:11px;color:var(--txt2);line-height:1.7;}
+  .chain b{color:var(--txt);} .chain .me{color:var(--sel);}
+  select{background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:5px;
+    padding:4px 6px;font-size:12px;}
+  .note{font-size:10.5px;color:var(--txt2);line-height:1.6;margin-top:6px;}
+  .pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;border:1px solid var(--line);}
+  .flex{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start;}
+  .exp{font-size:12.5px;line-height:1.75;color:var(--txt);}
+  .exp h3{margin:14px 0 6px;font-size:13px;color:var(--accent);font-weight:600;}
+  .exp h3:first-child{margin-top:4px;}
+  .exp p{margin:6px 0;}
+  .exp .formula{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line);
+    border-radius:5px;padding:7px 10px;margin:6px 0;color:var(--txt);font-size:12px;
+    overflow-x:auto;white-space:nowrap;}
+  .exp ul{margin:6px 0;padding-left:20px;}
+  .exp li{margin:3px 0;}
+  .exp b{color:var(--sel);font-weight:600;}
+  .exp .key{color:var(--accent);}
+  .exp em{color:var(--pos);font-style:normal;}
+</style>
+<script src="polyling_camera.js"></script>
+</head>
+<body>
+<div id="app">
+  <div id="left">
+    <header>
+      <h1>クオータニオン・4×4行列とボーン親子関係</h1>
+      <p>Unity Humanoid（指以外） / 左手系 Y-up / オイラー順 Z→X→Y / レスト姿勢の local 回転は単位</p>
+    </header>
+    <div id="collab">
+      <span class="dot" id="cDot" title="接続状態">●</span>
+      <span class="lbl">ID</span>
+      <input id="cId" class="cid" type="text" value="S0000" maxlength="16" title="共有ID：同じIDのクライアントと選択ボーンを共有">
+      <input id="cUrl" class="curl" type="text" value="ws://127.0.0.1:8765" placeholder="ws://127.0.0.1:8765">
+      <button id="cBtn">接続</button>
+      <label class="lbl" style="display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" id="cAuto" checked>自動反映</label>
+      <button id="cApply" title="編集した関節をタイムラインへ反映">適用</button>
+      <span class="frame">フレーム: <b id="cFrame">-</b></span>
+    </div>
+    <div id="viewWrap">
+      <canvas id="cv"></canvas>
+      <div id="viewbar">
+        <button data-view="front" class="on">正面</button>
+        <button data-view="side">側面</button>
+        <button data-view="persp">斜め</button>
+        <button id="tgAxis" class="on">ローカル軸</button>
+        <button id="tgLabel" class="on">名称</button>
+        <button id="tgHandle" title="選択した関節に回転ハンドル（丸に十文字・カメラ座標系）を表示して操作">回転ハンドル</button>
+        <span class="vctl"><span class="vlab">Z回転</span>
+          <input type="range" id="rollSld" class="vslider" min="-180" max="180" step="1" value="0">
+          <span class="vlab" id="rollVal">0°</span></span>
+      </div>
+      <div id="hint">PolyLing操作: 右ドラッグ=視点回転 / Alt+右=ロール / 中ドラッグ=パン / ホイール=ズーム / Shift=粗動 / Ctrl=微動　｜　子ボーン線・子関節を左ドラッグ=親ボーン回転 / クリック=選択</div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div class="card">
+      <h2>操作するボーン <span class="tag">XYZ スライダ＝ローカル オイラー角（度）</span></h2>
+      <div class="modeRow">
+        <span>モード:</span>
+        <button id="modePreset" class="modeBtn on">腕プリセット</button>
+        <button id="modeAll" class="modeBtn">全ボーン選択</button>
+        <button id="modeFinger" class="modeBtn" title="手に寄って指を編集する（指の骨があるときだけ）">指</button>
+      </div>
+      <div class="modeRow" id="fingerSideRow" style="display:none;">
+        <span>手:</span>
+        <button id="fingerLeft" class="modeBtn on">左手</button>
+        <button id="fingerRight" class="modeBtn">右手</button>
+      </div>
+      <div id="handPoseBox" style="display:none;">
+        <label class="hpCheck"><input type="checkbox" id="hpNoThumb" checked> 親指を除外（スライダで親指を動かさない）</label>
+        <div class="slrow"><span class="hpLab">握る</span><input type="range" id="hpGrip" min="-0.2" max="1" step="0.01" value="0"><span class="num" id="hpGripV">0.00</span></div>
+        <div class="slrow"><span class="hpLab">広げる</span><input type="range" id="hpSpread" min="-1" max="1" step="0.01" value="0"><span class="num" id="hpSpreadV">0.00</span></div>
+        <div class="slrow"><span class="hpLab">力を抜く</span><input type="range" id="hpRelax" min="0" max="1" step="0.01" value="0"><span class="num" id="hpRelaxV">0.00</span></div>
+        <div class="hpSignHead">ハンドサイン</div>
+        <div class="slrow"><span class="hpLab">1 指さし</span><input type="range" id="hpSign1" min="0" max="1" step="0.01" value="0"><span class="num" id="hpSign1V">0.00</span></div>
+        <div class="slrow"><span class="hpLab">2 ピース</span><input type="range" id="hpSign2" min="0" max="1" step="0.01" value="0"><span class="num" id="hpSign2V">0.00</span></div>
+        <div class="slrow"><span class="hpLab">3</span><input type="range" id="hpSign3" min="0" max="1" step="0.01" value="0"><span class="num" id="hpSign3V">0.00</span></div>
+        <div class="slrow"><span class="hpLab">4</span><input type="range" id="hpSign4" min="0" max="1" step="0.01" value="0"><span class="num" id="hpSign4V">0.00</span></div>
+        <div class="slrow"><span class="hpLab">5 パー</span><input type="range" id="hpSign5" min="0" max="1" step="0.01" value="0"><span class="num" id="hpSign5V">0.00</span></div>
+        <details class="hpDetails"><summary>角度の設定（度）</summary><div id="hpTable"></div></details>
+        <details class="hpDetails"><summary>ハンドサインの設定（曲げ＝握るの割合、開き＝度）</summary><div id="hpSignTable"></div></details>
+      </div>
+      <div class="editTabs" id="editTabs"></div>
+      <div id="allBoneRow" style="display:none;">
+        <select id="editSel"></select>
+      </div>
+      <div id="sliders"></div>
+      <div class="btnRow">
+        <button class="tb resetbtn" id="resetEdit">腕を初期化</button>
+        <button class="tb resetbtn" id="resetAll">全リセット</button>
+      </div>
+      <div class="note">スライダは選択中ボーンの <b>ローカル回転</b> を Z→X→Y 順で合成し、クオータニオン q を作ります。
+        <b>モード切替</b>で「腕プリセット」（既定）と「全ボーン選択」を切り替えられます。全ボーン選択では任意のボーンを
+        ドロップダウン（または 3D ビュー上でクリック）で選んで回せます。
+        <b>root（Hips）</b>を選ぶと <span style="color:var(--pos)">位置 t</span> のスライダも現れ、平行移動が world 行列の
+        右列に反映される様子を確認できます。</div>
+    </div>
+
+    <div class="card">
+      <h2>詳細表示するボーン</h2>
+      <div class="flex" style="align-items:center;">
+        <select id="inspectSel"></select>
+        <span class="pill" id="parentPill"></span>
+      </div>
+
+      <div style="margin-top:10px;">
+        <div class="lab" style="color:var(--txt2);font-size:10px;margin-bottom:2px;">
+          ローカル クオータニオン q = (w, x, y, z)</div>
+        <div class="qbox" id="quatBox"></div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <div class="lab" style="color:var(--txt2);font-size:10px;">ローカル 4×4 行列 <span style="color:var(--rot)">M_local = T · R</span></div>
+        <div id="localMat"></div>
+      </div>
+
+      <div style="margin-top:10px;">
+        <div class="lab" style="color:var(--txt2);font-size:10px;" id="parentMatLab">親の ワールド 4×4 行列</div>
+        <div id="parentMat"></div>
+      </div>
+
+      <div style="margin-top:10px;">
+        <div class="lab" style="color:var(--txt2);font-size:10px;">ワールド 4×4 行列 <span style="color:var(--pos)">M_world = 親.world · M_local</span></div>
+        <div id="worldMat"></div>
+        <div class="legend"><span class="r">■</span>回転(3×3) &nbsp; <span class="t">■</span>平行移動(右列) &nbsp; 末行 = (0 0 0 1)</div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <div class="lab" style="color:var(--txt2);font-size:10px;">親子合成チェーン（root → このボーン）</div>
+        <div class="chain" id="chainBox"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>解説 <span class="tag">4×4 行列・クオータニオン・3×3 ではダメな理由</span></h2>
+      <div class="exp">
+
+        <h3>1. 4×4 行列とは何か</h3>
+        <p>3D の点 <em>p = (x, y, z)</em> に対し、<b>回転と平行移動</b>を一度に作用させるための行列です。
+        点を <span class="key">同次座標</span> <em>(x, y, z, 1)</em> として 4 成分で書き、それに 4×4 の行列を掛けます。
+        構造はいつも次の形をしています。</p>
+        <div class="formula">
+          M = [ R<sub>3×3</sub>  |  t<sub>3×1</sub> ]<br>
+          &nbsp;&nbsp;&nbsp;&nbsp;[ 0  0  0  |  &nbsp;1 ]
+        </div>
+        <p>左上 3×3 が <span style="color:var(--rot)">回転（とスケール）</span>、右上 3×1 が
+        <span style="color:var(--pos)">平行移動</span>、末行は必ず (0, 0, 0, 1) です。
+        この形にしておくと、親子の連結は単に行列の積になります。</p>
+        <div class="formula">M_world(子) = M_world(親) · M_local(子)</div>
+        <p>本デモのチェーンは、まさにこの式を root から順番に掛け算しているだけです。</p>
+
+        <h3>2. なぜ 3 次元なのに 3×3 ではダメか</h3>
+        <p>3×3 行列で書ける変換は <span class="key">線形変換</span> だけです。回転・スケール・せん断は線形ですが、
+        平行移動 <em>v′ = v + t</em> は <b>線形ではありません</b>。なぜなら線形変換は必ず原点を原点に写すのに、
+        平行移動は原点を t だけ動かしてしまうからです。</p>
+        <p>線形でないと何が困るのか。<b>合成が行列の積で書けなくなる</b> のが致命的です。
+        もし回転 R と平行移動 t を 3×3 行列と別ベクトルで持ち回ると、子の世界座標を求める式は</p>
+        <div class="formula">p_world = R_親 (R_子 · p + t_子) + t_親</div>
+        <p>のようにネストが深くなり、ボーンが 10 段になれば 10 重の入れ子になります。
+        ここで <span class="key">同次座標</span> を導入し、ベクトルに余分な 1 を付け足して 4 次元として扱うと、
+        平行移動も 4×4 行列の積として表現できるようになります。</p>
+        <div class="formula">
+          [ x′ ]   [ R&nbsp;&nbsp;t ] [ x ]<br>
+          [ y′ ] = [ R&nbsp;&nbsp;t ] [ y ]<br>
+          [ z′ ]   [ R&nbsp;&nbsp;t ] [ z ]<br>
+          [ 1&nbsp; ]   [ 0&nbsp;&nbsp;1 ] [ 1 ]
+        </div>
+        <p>結果、ネストした入れ子は <em>M_world = M₁ · M₂ · … · Mₙ</em> という素直な行列積一発になり、
+        GPU のシェーダや骨スキニングが極めて簡潔になります。
+        <b>4×4 にする目的は次元を増やすことではなく、平行移動を「行列の積」の言語に押し込めることです。</b></p>
+        <p>補足：透視投影もこの 4×4 同次行列で表現できるので、CG パイプライン全体がたった一種類の行列で統一されるという副産物もあります。</p>
+
+        <h3>3. クオータニオンとは何か</h3>
+        <p>3D 回転を <span class="key">4 つの実数</span> <em>q = (w, x, y, z)</em> で表したものです。
+        単位ベクトル <em>n = (nx, ny, nz)</em> の周りに角度 <em>θ</em> だけ回す回転は、</p>
+        <div class="formula">q = ( cos(θ/2),&nbsp; nx·sin(θ/2),&nbsp; ny·sin(θ/2),&nbsp; nz·sin(θ/2) )</div>
+        <p>と書けます。常に |q| = 1 になるように正規化します。
+        回転の合成は <b>クオータニオン積</b> q₁·q₂ で表され、これが本デモの 3×3 回転行列に変換されて 4×4 に組み込まれます。</p>
+        <p>3D 回転は本質的には自由度 3 ですが、あえて 4 成分で持つことには理由があります。</p>
+        <ul>
+          <li><b>ジンバルロックが起きない</b>：オイラー角（XYZ の 3 つの角）は特定の姿勢で 1 軸が消失する病的特異点を持ちますが、クオータニオンは球面上の点として連続に振る舞います。</li>
+          <li><b>滑らかな補間ができる</b>：2 つの姿勢の間を最短経路で繋ぐ <em>Slerp</em>（球面線形補間）は、行列ではうまく書けませんがクオータニオンでは自然に書けます。アニメーションのキーフレーム補間が綺麗になります。</li>
+          <li><b>軽くて数値的に安定</b>：回転行列は 9 個の値で 6 個の直交拘束、クオータニオンは 4 個の値で 1 個の単位拘束。誤差が溜まっても <em>q ← q / |q|</em> で 1 行で再正規化できます。</li>
+          <li><b>姿勢の差分が表現しやすい</b>：q_差 = q_目標 · q_現在<sup>−1</sup> のように、回転の引き算が定義できます。</li>
+        </ul>
+        <p>欠点は人間が値を直感的に読めないことです。だからこの教材ではスライダ入力をオイラー角（°）にしておき、
+        内部で <em>q = q_Y · q_X · q_Z</em>（Unity の順序）に変換しています。スライダを動かしながら q の 4 値と
+        その |q| が常に 1 を保つ様子を眺めると、クオータニオンが「単位 4 次元ベクトル」として 3D 回転を表現しているのが体感できます。</p>
+
+        <h3>4. このデモで何が見えるか</h3>
+        <ul>
+          <li><b>親子伝播</b>：上腕を回すと、ひじ・手首の <em>ローカル</em> 行列は <b>1 ビットも変わらない</b> のに <em>ワールド</em> 行列は変わる。これは「子は親のワールドに自分のローカルを積むだけ」だからで、上に表示される<span class="key">親のワールド</span>と<span class="key">ローカル</span>を見比べると、ワールドの中身が <em>親.world · local</em> ぴったりに一致しているのが確認できます。</li>
+          <li><b>非対称性</b>：逆にひじを回しても、上腕は微動だにしません。子の変換は親に影響しないからです。</li>
+          <li><b>合成チェーン</b>：root（Hips）から選択ボーンまで、ローカル行列を順に掛けた積がそのままワールド行列になります。チェーン表示と各行列を見比べてください。</li>
+        </ul>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const D2R=Math.PI/180;
+
+/* ===================== quaternion ===================== */
+function qMul(a,b){const[aw,ax,ay,az]=a,[bw,bx,by,bz]=b;return[
+  aw*bw-ax*bx-ay*by-az*bz, aw*bx+ax*bw+ay*bz-az*by,
+  aw*by-ax*bz+ay*bw+az*bx, aw*bz+ax*by-ay*bx+az*bw];}
+function qAxis(d,ax,ay,az){const h=d*D2R/2,s=Math.sin(h);return[Math.cos(h),ax*s,ay*s,az*s];}
+// Unity Quaternion.Euler(x,y,z): apply Z, then X, then Y => q = qY*qX*qZ
+function eulerToQuat(x,y,z){return qMul(qMul(qAxis(y,0,1,0),qAxis(x,1,0,0)),qAxis(z,0,0,1));}
+function quatToMat3(q){const[w,x,y,z]=q;return[
+  1-2*(y*y+z*z),2*(x*y-w*z),2*(x*z+w*y),
+  2*(x*y+w*z),1-2*(x*x+z*z),2*(y*z-w*x),
+  2*(x*z-w*y),2*(y*z+w*x),1-2*(x*x+y*y)];}
+// 逆変換: R = Ry·Rx·Rz から ローカル オイラー角(度) X,Y,Z を抽出（eulerToQuatの逆）
+function quatToEuler(q){
+  const m=quatToMat3(q);
+  const X=Math.asin(Math.max(-1,Math.min(1,-m[5])));
+  let Y,Z;
+  if(Math.abs(Math.cos(X))>1e-6){ Z=Math.atan2(m[3],m[4]); Y=Math.atan2(m[2],m[8]); }
+  else { Z=0; Y=Math.atan2(-m[6],m[0]); }
+  return [X/D2R, Y/D2R, Z/D2R];
+}
+
+/* ===================== 4x4 (row-major, column-vector) ===================== */
+function mat4Id(){return[1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];}
+function mat4FromRT(m3,t){return[
+  m3[0],m3[1],m3[2],t[0],
+  m3[3],m3[4],m3[5],t[1],
+  m3[6],m3[7],m3[8],t[2],
+  0,0,0,1];}
+function mat4Mul(a,b){const r=new Array(16);
+  for(let i=0;i<4;i++)for(let j=0;j<4;j++){let s=0;
+    for(let k=0;k<4;k++)s+=a[i*4+k]*b[k*4+j];r[i*4+j]=s;}return r;}
+function mat4Pt(m,p){return[
+  m[0]*p[0]+m[1]*p[1]+m[2]*p[2]+m[3],
+  m[4]*p[0]+m[5]*p[1]+m[6]*p[2]+m[7],
+  m[8]*p[0]+m[9]*p[1]+m[10]*p[2]+m[11]];}
+
+/* ===================== skeleton (rest local rot = identity) ===================== */
+// offset = parent-local 位置（レスト姿勢、左手系 Y-up、+X=キャラ右 / 左側は -X）
+const BONES=[
+  ["Hips",null,[0,1.00,0],"Hips（腰）"],
+  ["Spine","Hips",[0,0.12,0],"Spine"],
+  ["Chest","Spine",[0,0.13,0],"Chest"],
+  ["UpperChest","Chest",[0,0.13,0],"UpperChest"],
+  ["Neck","UpperChest",[0,0.12,0],"Neck"],
+  ["Head","Neck",[0,0.10,0],"Head"],
+  ["LeftShoulder","UpperChest",[-0.06,0.10,0],"左肩"],
+  ["LeftUpperArm","LeftShoulder",[-0.12,0,0],"左上腕"],
+  ["LeftLowerArm","LeftUpperArm",[-0.27,0,0],"左ひじ（前腕）"],
+  ["LeftHand","LeftLowerArm",[-0.24,0,0],"左手首"],
+  ["RightShoulder","UpperChest",[0.06,0.10,0],"右肩"],
+  ["RightUpperArm","RightShoulder",[0.12,0,0],"右上腕"],
+  ["RightLowerArm","RightUpperArm",[0.27,0,0],"右ひじ"],
+  ["RightHand","RightLowerArm",[0.24,0,0],"右手首"],
+  ["LeftUpperLeg","Hips",[-0.09,-0.06,0],"左もも"],
+  ["LeftLowerLeg","LeftUpperLeg",[0,-0.40,0],"左すね"],
+  ["LeftFoot","LeftLowerLeg",[0,-0.40,0.02],"左足"],
+  ["LeftToes","LeftFoot",[0,-0.04,0.12],"左つま先"],
+  ["RightUpperLeg","Hips",[0.09,-0.06,0],"右もも"],
+  ["RightLowerLeg","RightUpperLeg",[0,-0.40,0],"右すね"],
+  ["RightFoot","RightLowerLeg",[0,-0.40,0.02],"右足"],
+  ["RightToes","RightFoot",[0,-0.04,0.12],"右つま先"],
+  ...FINGER_BONES()
+];
+/* 指の骨（左右 × 5 本 × 3 節 + 指先）。名前は Unity の Humanoid 名で、タイムライン・VRM・マッスルとそのままつながる。
+   長さと位置は T ポーズの手としての目安（実測ではない）。手のひらは下（-Y）、親指は前（+Z）。
+   指先（…Tip）は Humanoid にない表示用の骨で、末節（Distal）を子の関節つかみで回すためにある。 */
+function FINGER_BONES(){
+  const L=[ // [指, 日本語, 付け根の位置(手首から), 各節の長さ(基節→中節, 中節→末節, 末節→指先)]
+    ["Thumb","親指",[-0.020,-0.008,0.022],[[-0.025,0,0.015],[-0.022,0,0.008],[-0.020,0,0.004]]],
+    ["Index","人差し指",[-0.080,0,0.022],[[-0.035,0,0],[-0.022,0,0],[-0.020,0,0]]],
+    ["Middle","中指",[-0.085,0,0.006],[[-0.038,0,0],[-0.024,0,0],[-0.022,0,0]]],
+    ["Ring","薬指",[-0.080,0,-0.010],[[-0.034,0,0],[-0.022,0,0],[-0.020,0,0]]],
+    ["Little","小指",[-0.072,0,-0.025],[[-0.026,0,0],[-0.018,0,0],[-0.016,0,0]]],
+  ];
+  const out=[];
+  for(const [side,jp,sx] of [["Left","左",1],["Right","右",-1]]){
+    for(const [f,fjp,base,segs] of L){
+      const m=v=>[v[0]*sx,v[1],v[2]];
+      out.push([side+f+"Proximal",side+"Hand",m(base),jp+fjp+"1"]);
+      out.push([side+f+"Intermediate",side+f+"Proximal",m(segs[0]),jp+fjp+"2"]);
+      out.push([side+f+"Distal",side+f+"Intermediate",m(segs[1]),jp+fjp+"3"]);
+      out.push([side+f+"Tip",side+f+"Distal",m(segs[2]),jp+fjp+"先"]);
+    }
+  }
+  return out;
+}
+const bone={}, order=[];
+for(const[name,parent,off,jp] of BONES){
+  bone[name]={name,parent,off,jp,euler:[0,0,0],move:[0,0,0]}; order.push(name);
+}
+// 編集対象（スライダで動かすボーン）
+const EDIT=["LeftUpperArm","LeftLowerArm","LeftHand"];
+
+/* ===================== forward kinematics ===================== */
+function solve(){
+  for(const n of order){
+    const b=bone[n];
+    const q=eulerToQuat(b.euler[0],b.euler[1],b.euler[2]);
+    b.q=q;
+    b.qWorld = b.parent ? qMul(bone[b.parent].qWorld, q) : q.slice();   // ワールド回転（親·ローカル）
+    const t=[b.off[0]+b.move[0], b.off[1]+b.move[1], b.off[2]+b.move[2]];
+    b.local=mat4FromRT(quatToMat3(q), t);
+    b.world = b.parent ? mat4Mul(bone[b.parent].world, b.local) : b.local.slice();
+    b.pos=[b.world[3],b.world[7],b.world[11]];
+  }
+}
+
+/* ===================== view / projection ===================== */
+const cv=document.getElementById("cv"), ctx=cv.getContext("2d");
+// 視点は PolyLing と同じ作り（polyling_camera.js）。表示は平行投影で、見える範囲の高さ = 2 × 距離 × tan(画角/2)。
+const cam=new PLCamera();
+let dpr=1;
+let showAxis=true, showLabel=true;
+let selected="LeftUpperArm", editBone="LeftUpperArm";
+let selSet=new Set([selected]);   // 複数選択（共有・ハイライト対象のボーン名）
+let editMode="preset";   // "preset"=腕プリセット / "all"=全ボーン選択 / "finger"=指
+let fingerSide="Left";   // 指モードで編集する手
+// 指の骨か（Humanoid 名で判定。…Tip は表示用の指先）。返り値 {side, tip} か null
+const FINGER_RE=/^(Left|Right)(Thumb|Index|Middle|Ring|Little)(Proximal|Intermediate|Distal|Tip)$/;
+function fingerInfo(n){const b=bone[n];if(!b)return null;const m=FINGER_RE.exec(b.humanoid||n)||FINGER_RE.exec(n);
+  return m?{side:m[1],tip:m[3]==="Tip"}:null;}
+// 表示するか：指は指モードで、選んだ手のものだけ表示する（全身の操作では出さない）
+function boneVisible(n){const f=fingerInfo(n);return !f||(editMode==="finger"&&f.side===fingerSide);}
+// 指モードのタブ：選んだ手の指（指先を除く）
+function fingerTabs(side){return order.filter(n=>{const f=fingerInfo(n);return f&&!f.tip&&f.side===side;});}
+// 編集ハイライト対象（青く表示するボーン集合）
+function editHi(){
+  if(editMode==="finger") return new Set(fingerTabs(fingerSide));
+  return editMode==="preset" ? new Set([...EDIT,"LeftShoulder"]) : new Set([editBone]);
+}
+
+// 視点ボタン：[rotX, rotY]（度）。正面 = +Z 側から、側面 = キャラの左側から、斜め = 左前やや上から。
+const VIEWS={front:[0,180],side:[0,90],persp:[20,215]};
+
+function resize(){
+  dpr=window.devicePixelRatio||1;
+  cv.width=cv.clientWidth*dpr; cv.height=cv.clientHeight*dpr;
+  draw();
+}
+// 画面の縮尺（px / m）。PolyLing の正投影と同じく、見える高さ = 2 × 距離 × tan(画角/2)。
+function viewScale(){return cv.height/(2*cam.distance*Math.tan(cam.fov*D2R/2));}
+// ワールド（Unity 座標）→ [画面x, 画面y, 手前ほど大きい奥行き]
+function project(p){
+  const B=cam.basis(),d=[p[0]-B.pos[0],p[1]-B.pos[1],p[2]-B.pos[2]],s=viewScale();
+  const X=d[0]*B.right[0]+d[1]*B.right[1]+d[2]*B.right[2];
+  const Y=d[0]*B.up[0]+d[1]*B.up[1]+d[2]*B.up[2];
+  const F=d[0]*B.fwd[0]+d[1]*B.fwd[1]+d[2]*B.fwd[2];
+  return [cv.width/2 + X*s, cv.height/2 - Y*s, -F];
+}
+function draw(){
+  const W=cv.width,H=cv.height;
+  ctx.clearRect(0,0,W,H); ctx.fillStyle="#0d1117"; ctx.fillRect(0,0,W,H);
+  const hi=editHi();
+  // ground grid
+  ctx.strokeStyle="#1b2230"; ctx.lineWidth=1*dpr;
+  for(let i=-3;i<=3;i++){
+    let a=project([i*0.2,0,-0.6]),b=project([i*0.2,0,0.6]);
+    ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();
+    let c=project([-0.6,0,i*0.2]),d=project([0.6,0,i*0.2]);
+    ctx.beginPath();ctx.moveTo(c[0],c[1]);ctx.lineTo(d[0],d[1]);ctx.stroke();
+  }
+  // hovered child handle: 親ボーンの淡い背面ハイライト＋回転円
+  if(typeof hoverChild!=="undefined" && hoverChild && bone[hoverChild] && bone[hoverChild].parent){
+    const child=bone[hoverChild],parent=bone[child.parent];
+    const hs=project(child.pos),ps=project(parent.pos),rr=Math.hypot(hs[0]-ps[0],hs[1]-ps[1]);
+    ctx.save();
+    // 親ボーン（親関節→ホバー中の子関節）。通常の非選択線より明るい灰色の太い下地。
+    ctx.strokeStyle="rgba(176,186,200,0.52)";ctx.lineWidth=8*dpr;ctx.lineCap="round";
+    ctx.beginPath();ctx.moveTo(ps[0],ps[1]);ctx.lineTo(hs[0],hs[1]);ctx.stroke();
+    // 親関節を中心、親→子の長さを半径とする回転円。ボーンより背面の補助線。
+    ctx.strokeStyle="rgba(176,186,200,0.44)";ctx.lineWidth=1.5*dpr;ctx.setLineDash([5*dpr,5*dpr]);
+    ctx.beginPath();ctx.arc(ps[0],ps[1],rr,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle="rgba(176,186,200,0.55)";ctx.beginPath();ctx.arc(ps[0],ps[1],3*dpr,0,Math.PI*2);ctx.fill();
+    ctx.restore();
+  }
+  // collect drawables with depth
+  const segs=[];
+  for(const n of order){
+    const b=bone[n];
+    const sp=project(b.pos);
+    b._s=sp;
+    if(b.parent&&boneVisible(n)){const pp=project(bone[b.parent].pos);segs.push({z:(sp[2]+pp[2])/2,a:pp,b:sp,n});}
+  }
+  // bones
+  segs.sort((u,v)=>u.z-v.z);
+  for(const s of segs){
+    const onArm=hi.has(s.n);
+    ctx.strokeStyle = onArm? "#3a7bd5" : "#3a4456";
+    ctx.lineWidth=(onArm?5:3.5)*dpr; ctx.lineCap="round";
+    ctx.beginPath();ctx.moveTo(s.a[0],s.a[1]);ctx.lineTo(s.b[0],s.b[1]);ctx.stroke();
+  }
+  // local axis gizmos
+  const joints=order.filter(boneVisible).map(n=>({n,s:bone[n]._s})).sort((a,b)=>a.s[2]-b.s[2]);
+  if(showAxis){
+    const L=editMode==="finger"?0.015:0.06;   // 指モードは軸を短く
+    for(const n of order){
+      if(!boneVisible(n))continue;
+      const b=bone[n];
+      const ax=["#ff6b6b","#7fd17f","#5b8dff"];
+      const dirs=[[L,0,0],[0,L,0],[0,0,L]];
+      for(let i=0;i<3;i++){
+        const tip=mat4Pt(b.world,dirs[i]);
+        const o=b._s, t=project(tip);
+        ctx.strokeStyle=ax[i];ctx.lineWidth=1.6*dpr;
+        ctx.beginPath();ctx.moveTo(o[0],o[1]);ctx.lineTo(t[0],t[1]);ctx.stroke();
+      }
+    }
+  }
+  // joints (dots) + labels
+  for(const {n,s} of joints){
+    const b=bone[n];
+    const isSel=(n===selected);
+    const inSet=selSet.has(n)&&!isSel;
+    const isChild=(n===dragChild);
+    if(isChild){                                   // ドラッグ中の子ボーン: 薄い強調（親と同サイズ）
+      ctx.fillStyle="rgba(244,163,94,0.16)";
+      ctx.beginPath();ctx.arc(s[0],s[1],13*dpr,0,7);ctx.fill();
+      ctx.strokeStyle="rgba(244,163,94,0.85)";ctx.lineWidth=1.6*dpr;ctx.setLineDash([4*dpr,3*dpr]);
+      ctx.beginPath();ctx.arc(s[0],s[1],11*dpr,0,7);ctx.stroke();ctx.setLineDash([]);
+    }
+    const r=(isSel?7:inSet?6:4.5)*dpr;
+    ctx.fillStyle=isSel?"#ffd166":inSet?"#f0a35e":(hi.has(n)?"#4fc3f7":"#7d8aa0");
+    ctx.beginPath();ctx.arc(s[0],s[1],r,0,7);ctx.fill();
+    if(isSel){ctx.strokeStyle="#ffd166";ctx.lineWidth=2*dpr;
+      ctx.beginPath();ctx.arc(s[0],s[1],r+4*dpr,0,7);ctx.stroke();}
+    else if(inSet){ctx.strokeStyle="#f0a35e";ctx.lineWidth=1.5*dpr;
+      ctx.beginPath();ctx.arc(s[0],s[1],r+3*dpr,0,7);ctx.stroke();}
+    if(showLabel && (hi.has(n)||n==="Hips"||n==="Head"||isSel||inSet||isChild)){
+      ctx.fillStyle=isSel?"#ffd166":inSet?"#f0a35e":"#9fb0c8";
+      ctx.font=`${12*dpr}px sans-serif`;ctx.textBaseline="middle";
+      ctx.fillText(b.jp, s[0]+9*dpr, s[1]-9*dpr);
+    }
+  }
+  // 回転ハンドル（カメラ座標系の「丸に十文字」: 横=赤(画面X軸), 縦=緑(画面Y軸), 円=青(視軸)）
+  if(handleMode && bone[selected]){
+    const c=bone[selected]._s, Rh=HANDLE_R*dpr, hot=(hdrag?hdrag.axis:null);
+    ctx.lineWidth=2*dpr;
+    ctx.strokeStyle = hot==='fwd' ? "#93c5fd" : "rgba(96,165,250,0.85)";   // 円=視軸
+    ctx.beginPath();ctx.arc(c[0],c[1],Rh,0,7);ctx.stroke();
+    ctx.strokeStyle = hot==='right' ? "#fca5a5" : "rgba(248,113,113,0.95)"; // 横線=画面X軸
+    ctx.beginPath();ctx.moveTo(c[0]-Rh,c[1]);ctx.lineTo(c[0]+Rh,c[1]);ctx.stroke();
+    ctx.strokeStyle = hot==='up' ? "#86efac" : "rgba(74,222,128,0.95)";     // 縦線=画面Y軸
+    ctx.beginPath();ctx.moveTo(c[0],c[1]-Rh);ctx.lineTo(c[0],c[1]+Rh);ctx.stroke();
+  }
+}
+
+/* ===== picking ===== */
+function pickJoint(mx,my){           // 画面座標(device px)に最も近い関節ボーン名
+  let best=null,bd=18*dpr;
+  for(const n of order){if(!boneVisible(n))continue;const s=bone[n]._s;const d=Math.hypot(s[0]-mx,s[1]-my);
+    if(d<bd){bd=d;best=n;}}
+  return best;
+}
+/* ===== マウス操作（関節ドラッグ＝親ボーン回転 / 回転 / パン / ズーム）===== */
+// --- 逆投影: 画面座標(device px) と 奥行きZd から ワールド座標を復元（projectの逆）---
+function depthOf(p){return project(p)[2];}
+function worldFromScreen(px,py,Zd){
+  const B=cam.basis(),s=viewScale(),X=(px-cv.width/2)/s,Y=-(py-cv.height/2)/s,F=-Zd;
+  return [0,1,2].map(i=>B.pos[i]+B.right[i]*X+B.up[i]*Y+B.fwd[i]*F);
+}
+function qConj(q){return [q[0],-q[1],-q[2],-q[3]];}
+function vsub(a,b){return [a[0]-b[0],a[1]-b[1],a[2]-b[2]];}
+function vdot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+function vcross(a,b){return [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];}
+function vlen(a){return Math.hypot(a[0],a[1],a[2]);}
+function vnorm(a){const l=vlen(a)||1;return [a[0]/l,a[1]/l,a[2]/l];}
+
+let dragChild=null;   // ドラッグ中に薄く強調する子ボーン名（操作対象は親=selected）
+let jdrag=null;       // {child, parent, started}
+let handleMode=false; // 回転ハンドルモード（既定OFF。ドラッグ親操作と併用可）
+let hdrag=null;       // {axis:'right'|'up'|'fwd', lx, ly, cx, cy}
+const HANDLE_R=46;    // ハンドル半径(px, dpr前)
+
+// ビュー方向(画面X/Y/視軸)→ワールド方向（projectの回転部の逆）
+function viewDirToWorld(Xr,Yr,Zd){
+  const B=cam.basis();return [0,1,2].map(i=>B.right[i]*Xr+B.up[i]*Yr-B.fwd[i]*Zd);
+}
+const camRight=()=>viewDirToWorld(1,0,0);   // 画面右（世界）
+const camUp   =()=>viewDirToWorld(0,1,0);    // 画面上（世界）
+const camFwd  =()=>viewDirToWorld(0,0,1);    // 視軸（手前向き, 世界）
+
+// ボーンnameをワールド軸axis(単位)まわりにang(rad)回転（自分のローカル回転に反映）
+function applyWorldRot(name,axis,ang){
+  const h=ang/2, si=Math.sin(h);
+  const R=[Math.cos(h),axis[0]*si,axis[1]*si,axis[2]*si];
+  const Wp=bone[name].parent ? bone[bone[name].parent].qWorld : [1,0,0,0];
+  const Rlocal=qMul(qMul(qConj(Wp),R),Wp);
+  bone[name].euler=quatToEuler(qMul(Rlocal,bone[name].q));
+  solve();
+}
+// 選択ボーンのハンドル上のどのゾーンか（device px）。null=ハンドル外
+function handleZone(mx,my){
+  if(!handleMode || !bone[selected]) return null;
+  const c=bone[selected]._s, Rh=HANDLE_R*dpr, tol=8*dpr, inner=12*dpr;
+  const dx=mx-c[0], dy=my-c[1], d=Math.hypot(dx,dy);
+  if(d<inner) return null;                       // 中心付近はジョイント操作に譲る
+  if(Math.abs(d-Rh)<tol) return 'fwd';           // 円周 → 視軸
+  if(d<=Rh+tol){
+    if(Math.abs(dy)<tol && Math.abs(dx)<=Rh+tol) return 'right'; // 横線 → 画面X軸
+    if(Math.abs(dx)<tol && Math.abs(dy)<=Rh+tol) return 'up';    // 縦線 → 画面Y軸
+  }
+  return null;
+}
+
+// 子関節をカーソルへ寄せるよう、親ボーンのローカル回転を更新
+function jdragMove(mx,my){
+  const J=jdrag.child, P=jdrag.parent;
+  const pivot=bone[P].pos, Jw=bone[J].pos;
+  const Cw=worldFromScreen(mx,my,depthOf(Jw));     // J と同じ奥行き平面上のカーソル位置
+  const v0=vnorm(vsub(Jw,pivot)), v1=vnorm(vsub(Cw,pivot));
+  let c=Math.max(-1,Math.min(1,vdot(v0,v1)));
+  let ax=vcross(v0,v1); const sn=vlen(ax);
+  if(sn<1e-6) return;
+  ax=[ax[0]/sn,ax[1]/sn,ax[2]/sn];
+  const ang=Math.atan2(sn,c), h=ang/2, si=Math.sin(h);
+  const R=[Math.cos(h),ax[0]*si,ax[1]*si,ax[2]*si];          // ワールド増分回転
+  const Wp=bone[P].parent ? bone[bone[P].parent].qWorld : [1,0,0,0];
+  const Rlocal=qMul(qMul(qConj(Wp),R),Wp);                    // 親フレームへ写像
+  bone[P].euler=quatToEuler(qMul(Rlocal,bone[P].q));
+  solve();
+}
+
+cv.addEventListener("click",e=>{
+  if(dragMoved)return;
+  const rect=cv.getBoundingClientRect();
+  const mx=(e.clientX-rect.left)*dpr,my=(e.clientY-rect.top)*dpr;
+  const best=pickJoint(mx,my);
+  if(!best)return;
+  if(e.shiftKey||e.ctrlKey||e.metaKey){          // 複数選択：トグル
+    if(selSet.has(best)&&selSet.size>1)selSet.delete(best); else selSet.add(best);
+  }else{ selSet=new Set([best]); }               // 単独選択
+  selected=best; syncSelToUI(); refresh(); emitBones();
+});
+/* ===== PolyLing準拠 camera / 関節ドラッグ =====
+   視点操作は PolyLing と同じ（polyling_camera.js）: 右ドラッグ=回転, Alt+右=視線まわり, 中ドラッグ=平行移動, ホイール=拡大縮小
+   Shift=粗動4x, Ctrl=微動0.2x, Shift+Ctrl=等倍。左は選択/関節編集専用。 */
+let dragging=false,panning=false,lx=0,ly=0,dragMoved=false,activePointer=null,hoverChild=null;
+const cameraSpeed=e=>(!!e.shiftKey===(!!e.ctrlKey||!!e.metaKey))?1:(e.shiftKey?4:0.2);
+function syncRollUi(){const d=cam.rotZ,rs=document.getElementById("rollSld");if(rs)rs.value=Math.max(-180,Math.min(180,d));
+  const rv=document.getElementById("rollVal");if(rv)rv.textContent=d.toFixed(0)+"°";}
+function pointSegmentDistance(px,py,ax,ay,bx,by){const dx=bx-ax,dy=by-ay,l2=dx*dx+dy*dy;
+  const t=l2?Math.max(0,Math.min(1,((px-ax)*dx+(py-ay)*dy)/l2)):0;
+  return Math.hypot(px-(ax+t*dx),py-(ay+t*dy));}
+function pickChildHandle(mx,my){
+  const joint=pickJoint(mx,my);if(joint&&bone[joint].parent)return joint;
+  let best=null,bd=11*dpr;
+  for(const n of order){const b=bone[n];if(!b.parent||!boneVisible(n))continue;const a=bone[b.parent]._s,c=b._s;
+    const d=pointSegmentDistance(mx,my,a[0],a[1],c[0],c[1]);if(d<bd){bd=d;best=n;}}
+  return best;
+}
+const drawWithoutHandleHover=draw;
+draw=function(){drawWithoutHandleHover();if(!hoverChild||!bone[hoverChild])return;const s=bone[hoverChild]._s;
+  ctx.save();ctx.strokeStyle="rgba(251,191,36,.95)";ctx.lineWidth=2*dpr;ctx.setLineDash([4*dpr,3*dpr]);
+  ctx.beginPath();ctx.arc(s[0],s[1],11*dpr,0,Math.PI*2);ctx.stroke();ctx.restore();};
+cv.addEventListener("pointerdown",e=>{
+  activePointer=e.pointerId;try{cv.setPointerCapture(e.pointerId);}catch(_){}
+  dragMoved=false;lx=e.clientX;ly=e.clientY;
+  if(e.button===1){panning=true;e.preventDefault();return;}        // PolyLing: 中=pan
+  if(e.button===2){dragging=true;e.preventDefault();return;}       // PolyLing: 右=orbit / Alt+右=roll
+  if(e.button===0 && !(e.shiftKey||e.ctrlKey||e.metaKey)){
+    const rect=cv.getBoundingClientRect();
+    const mx=(e.clientX-rect.left)*dpr,my=(e.clientY-rect.top)*dpr;
+    const zone=handleZone(mx,my);                                  // 左: 回転ハンドル優先
+    if(zone){ hdrag={axis:zone,lx:mx,ly:my,cx:bone[selected]._s[0],cy:bone[selected]._s[1]};
+      dragMoved=true; draw(); return; }
+    const hit=pickChildHandle(mx,my);                              // 左: 子関節/子ボーン線をレバーに親を回す
+    if(hit && bone[hit].parent){hoverChild=hit;jdrag={child:hit,parent:bone[hit].parent,started:false};draw();return;}
+  }
+});
+cv.addEventListener("contextmenu",e=>e.preventDefault());
+cv.addEventListener("auxclick",e=>{if(e.button===1)e.preventDefault();});
+window.addEventListener("pointermove",e=>{
+  if(activePointer===null){if(e.target!==cv)return;const rect=cv.getBoundingClientRect();
+    const hit=pickChildHandle((e.clientX-rect.left)*dpr,(e.clientY-rect.top)*dpr);
+    if(hit!==hoverChild){hoverChild=hit;cv.style.cursor=hit?'grab':'default';draw();}return;}
+  if(e.pointerId!==activePointer)return;
+  if(hdrag){
+    const rect=cv.getBoundingClientRect();
+    const mx=(e.clientX-rect.left)*dpr,my=(e.clientY-rect.top)*dpr;
+    const k=0.011;                                  // ボーンハンドル感度（カメラ速度修飾の対象外）
+    let axis,ang;
+    if(hdrag.axis==='fwd'){
+      const a0=Math.atan2(hdrag.ly-hdrag.cy,hdrag.lx-hdrag.cx);
+      const a1=Math.atan2(my-hdrag.cy,mx-hdrag.cx);
+      ang=(a1-a0); axis=camFwd();                   // マウスと同じ向きに画面上で回る
+    }else if(hdrag.axis==='up'){ang=-(mx-hdrag.lx)*k; axis=camUp();}   // 右へドラッグ → 手前側が右へ
+    else{ang=-(my-hdrag.ly)*k; axis=camRight();}                      // 下へドラッグ → 手前側が下へ
+    if(ang){ applyWorldRot(selected,axis,ang); onBoneEdited(selected,true); draw(); updatePanels(); }
+    hdrag.lx=mx; hdrag.ly=my; return;
+  }
+  if(jdrag){
+    const dx=e.clientX-lx,dy=e.clientY-ly;
+    if(!jdrag.started && Math.abs(dx)+Math.abs(dy)<=3) return;
+    if(!jdrag.started){jdrag.started=true;dragMoved=true;const P=jdrag.parent;selected=P;selSet=new Set([P]);dragChild=jdrag.child;syncSelToUI();emitBones();}
+    const rect=cv.getBoundingClientRect();jdragMove((e.clientX-rect.left)*dpr,(e.clientY-rect.top)*dpr);
+    onBoneEdited(jdrag.parent,true);draw();updatePanels();return;
+  }
+  const dx=e.clientX-lx,dy=e.clientY-ly,speed=cameraSpeed(e);
+  if(panning){cam.pan(dx,-dy,speed);lx=e.clientX;ly=e.clientY;draw();return;}   // PolyLing と同じ（polyling_camera.js）
+  if(!dragging)return;
+  if(Math.abs(dx)+Math.abs(dy)>3)dragMoved=true;
+  cam.orbit(dx,-dy,speed,e.altKey);if(e.altKey)syncRollUi();
+  lx=e.clientX;ly=e.clientY;draw();
+});
+function finishPointer(e){if(activePointer!==null&&e&&e.pointerId!==activePointer)return;
+  if(hdrag){if(bqAuto)flushPose();hdrag=null;buildSliders();draw();}                     // スライダの値もドラッグ後の角度に
+  if(jdrag){if(jdrag.started&&bqAuto)flushPose();jdrag=null;dragChild=null;buildSliders();draw();}
+  dragging=false;panning=false;hoverChild=null;cv.style.cursor='default';
+  if(activePointer!==null){try{cv.releasePointerCapture(activePointer);}catch(_){}activePointer=null;}draw();
+}
+window.addEventListener("pointerup",finishPointer);
+window.addEventListener("pointercancel",finishPointer);
+cv.addEventListener("wheel",e=>{e.preventDefault();const speed=cameraSpeed(e);
+  cam.zoom(PLCamera.scrollOf(e),speed);draw();
+},{passive:false});
+
+/* ===================== UI build ===================== */
+const editTabsEl=document.getElementById("editTabs");
+EDIT.forEach(n=>{const btn=document.createElement("button");btn.textContent=bone[n].jp;
+  btn.onclick=()=>{setEditTab(n);selected=n;selSet=new Set([n]);document.getElementById("inspectSel").value=n;refresh();emitBones();};
+  btn.dataset.b=n;editTabsEl.appendChild(btn);});
+function setEditTab(n){if(!EDIT.includes(n))return;editBone=n;
+  [...editTabsEl.children].forEach(b=>b.classList.toggle("on",b.dataset.b===n));buildSliders();}
+
+const slidersEl=document.getElementById("sliders");
+function buildSliders(){
+  slidersEl.innerHTML="";
+  const b=bone[editBone];
+  // --- 回転（ローカル オイラー角） ---
+  ["X","Y","Z"].forEach((ax,i)=>{
+    const row=document.createElement("div");row.className="slrow";
+    row.innerHTML=`<span class="ax ${ax}">${ax}</span>
+      <input type="range" min="-180" max="180" step="1" value="${b.euler[i]}">
+      <span class="num">${b.euler[i].toFixed(0)}</span><span class="unit">°</span>`;
+    const rng=row.querySelector("input"),num=row.querySelector(".num");
+    rng.oninput=()=>{b.euler[i]=+rng.value;num.textContent=(+rng.value).toFixed(0);solve();draw();updatePanels();onBoneEdited(editBone);};
+    slidersEl.appendChild(row);
+  });
+  // --- 位置（root のみ：平行移動 t） ---
+  if(b.parent===null){
+    const lab=document.createElement("div");lab.className="subLab";
+    lab.textContent="位置 t（root の平行移動）";slidersEl.appendChild(lab);
+    ["X","Y","Z"].forEach((ax,i)=>{
+      const row=document.createElement("div");row.className="slrow";
+      row.innerHTML=`<span class="ax ${ax}">${ax}</span>
+        <input type="range" min="-0.8" max="0.8" step="0.01" value="${b.move[i]}">
+        <span class="num">${b.move[i].toFixed(2)}</span><span class="unit"></span>`;
+      const rng=row.querySelector("input"),num=row.querySelector(".num");
+      rng.oninput=()=>{b.move[i]=+rng.value;num.textContent=(+rng.value).toFixed(2);solve();draw();updatePanels();onBoneEdited(editBone);};
+      slidersEl.appendChild(row);
+    });
+  }
+}
+
+/* ----- 編集モード（腕プリセット / 全ボーン選択） ----- */
+const editSel=document.getElementById("editSel");
+order.forEach(n=>{if(fingerInfo(n))return;const o=document.createElement("option");o.value=n;o.textContent=bone[n].jp+"  ("+n+")";editSel.appendChild(o);});   // 指は「指」モードで編集する
+editSel.value=editBone;
+editSel.onchange=()=>{editBone=editSel.value;selected=editBone;selSet=new Set([editBone]);
+  document.getElementById("inspectSel").value=editBone;buildSliders();refresh();emitBones();};
+
+const modePresetBtn=document.getElementById("modePreset");
+const modeAllBtn=document.getElementById("modeAll");
+const modeFingerBtn=document.getElementById("modeFinger");
+let presetEdit=null;   // 指モードの間、腕プリセットのタブ（EDIT）を退避しておく
+function updateResetLabel(){
+  document.getElementById("resetEdit").textContent =
+    editMode==="preset" ? "腕を初期化" : editMode==="finger" ? "指を初期化" : "このボーンを初期化";
+}
+// 指モードに入る／手を替えるとき：タブを選んだ手の指に差し替え、カメラをその手に寄せる
+function enterFinger(side){
+  fingerSide=side;
+  if(!presetEdit)presetEdit=EDIT.slice();
+  EDIT.length=0; fingerTabs(side).forEach(n=>EDIT.push(n));
+  rebuildBoneUI(); editTabsEl.classList.add("finger");
+  document.getElementById("fingerLeft").classList.toggle("on",side==="Left");
+  document.getElementById("fingerRight").classList.toggle("on",side==="Right");
+  fitHand(side);
+}
+function leaveFinger(){
+  if(presetEdit){EDIT.length=0;presetEdit.forEach(n=>EDIT.push(n));presetEdit=null;}
+  editTabsEl.classList.remove("finger"); rebuildBoneUI(); autoFitView();
+}
+// 手首と、その手の指（指先を含む）の範囲に寄せる（全体表示と同じ決め方）
+function fitHand(side){
+  const hand=order.find(n=>(bone[n].humanoid||n)===side+"Hand");
+  const ns=order.filter(n=>{const f=fingerInfo(n);return f&&f.side===side;}).concat(hand?[hand]:[]);
+  if(!ns.length)return; solve();
+  const mn=[1e9,1e9,1e9],mx=[-1e9,-1e9,-1e9];
+  ns.forEach(n=>{const p=bone[n].pos;for(let i=0;i<3;i++){mn[i]=Math.min(mn[i],p[i]);mx[i]=Math.max(mx[i],p[i]);}});
+  cam.fit([0,1,2].map(i=>(mn[i]+mx[i])/2),Math.max(1e-3,Math.hypot(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2])));
+}
+function updateFingerButton(){
+  const ok=fingerTabs("Left").length>0||fingerTabs("Right").length>0;
+  modeFingerBtn.disabled=!ok; modeFingerBtn.title=ok?"手に寄って指を編集する":"この骨格には指の骨がありません";
+}
+function setMode(m){
+  const was=editMode;
+  if(m==="finger"&&modeFingerBtn.disabled)return;
+  editMode=m;
+  modePresetBtn.classList.toggle("on",m==="preset");
+  modeAllBtn.classList.toggle("on",m==="all");
+  modeFingerBtn.classList.toggle("on",m==="finger");
+  document.getElementById("fingerSideRow").style.display = (m==="finger") ? "flex" : "none";
+  document.getElementById("handPoseBox").style.display = (m==="finger") ? "block" : "none";
+  if(m==="finger"){ const side=fingerTabs(fingerSide).length?fingerSide:(fingerSide==="Left"?"Right":"Left"); enterFinger(side); }
+  else if(was==="finger") leaveFinger();
+  editTabsEl.style.display = (m==="preset"||m==="finger") ? "flex" : "none";
+  document.getElementById("allBoneRow").style.display = (m==="all") ? "block" : "none";
+  if(m==="preset"||m==="finger"){
+    if(!EDIT.includes(editBone)) editBone=EDIT[0];
+    setEditTab(editBone); selected=editBone;
+  }else{
+    if(fingerInfo(editBone)) editBone=EDIT[0]||order[0];   // 全身の操作では指を選ばない
+    editSel.value=editBone; selected=editBone;
+  }
+  document.getElementById("inspectSel").value=selected;
+  selSet=new Set([selected]);
+  updateResetLabel(); buildSliders(); refresh(); emitBones();
+}
+/* ===== 手のポーズ（握る・広げる・力を抜く の 3 本を混ぜる）=====
+   関節ごとに 曲げ = 握る×握るの角度 + 力を抜く×力を抜くの角度 + Σ サインi×(サインiの曲げの割合×握るの角度)、
+               開き = 広げる×広げるの角度 + 力を抜く×力を抜くの開き + Σ サインi×サインiの開き（開きは付け根の節だけ）。
+   握るは −0.2〜1。マイナスは同じ角度で反対向きに反らす（びしっと伸ばす）。
+   ハンドサイン 1〜5 も同じく足し合わせる（1 指さし、2 ピース、3、4、5 パー）。
+   付け根は「開いてから曲げる」: 回転 = 開き · 曲げ（曲げは指の向きのまま、それを開きの軸で振る）。
+   軸は骨格のレスト位置から決める（レストの回転は恒等）:
+     指の向き d = 次の節（無ければ前の節から）への向き、手のひらの向き n = 下（-Y。T ポーズで手のひらは下）、
+     親指側 t = 手首から親指の付け根への向きから、手の向きと n の成分を除いたもの（無ければ +Z）。
+     曲げ = 軸 d×n で d を n へ、開き = 軸 d×t で d を t へ回す（正の角度で）。
+   角度は見た目として自然な値として決めた目安（Unity の可動域ではない）。下の表で変えられる。
+   スライダを動かすと、その手の指の角度は上書きされる。「親指を除外」（既定でオン）のときは親指には触れない。 */
+const HP_FINGERS=[["Thumb","親指"],["Index","人差し指"],["Middle","中指"],["Ring","薬指"],["Little","小指"]];
+const HP_JOINTS=["Proximal","Intermediate","Distal"];
+const HP={   // 角度（度）。curl=[付け根, 中節, 先]、spread=付け根の開き（親指側が正）
+  grip  :{curl:{Thumb:[40,40,50],Index:[70,90,70],Middle:[70,90,70],Ring:[70,90,70],Little:[70,90,70]}},
+  spread:{spread:{Thumb:20,Index:15,Middle:0,Ring:-7.5,Little:-15}},
+  relax :{curl:{Thumb:[15,10,10],Index:[15,20,10],Middle:[20,25,12],Ring:[25,30,15],Little:[30,35,18]},
+          spread:{Thumb:0,Index:3,Middle:0,Ring:-3,Little:-6}},
+};
+// ハンドサイン：curl = 指ごとに「握るの角度の何割まで曲げるか」、spread = 付け根の開き（度、親指側が正）
+const HP_SIGNS=[
+  {curl:{Thumb:0.8,Index:0,Middle:1,Ring:1,Little:1},spread:{Thumb:0,Index:0,Middle:0,Ring:0,Little:0}},     // 1 指さし
+  {curl:{Thumb:0.8,Index:0,Middle:0,Ring:1,Little:1},spread:{Thumb:0,Index:8,Middle:-8,Ring:0,Little:0}},    // 2 ピース
+  {curl:{Thumb:0.8,Index:0,Middle:0,Ring:0,Little:1},spread:{Thumb:0,Index:8,Middle:0,Ring:-8,Little:0}},    // 3
+  {curl:{Thumb:0.8,Index:0,Middle:0,Ring:0,Little:0},spread:{Thumb:0,Index:8,Middle:0,Ring:-5,Little:-10}}, // 4
+  {curl:{Thumb:0,Index:0,Middle:0,Ring:0,Little:0},spread:{Thumb:20,Index:15,Middle:0,Ring:-7.5,Little:-15}},// 5 パー
+];
+const hpVal={grip:0,spread:0,relax:0,signs:[0,0,0,0,0]};
+function hpRestPos(n){const p=[0,0,0];for(let b=bone[n];b;b=b.parent?bone[b.parent]:null){p[0]+=b.off[0];p[1]+=b.off[1];p[2]+=b.off[2];}return p;}
+function hpFind(h){return order.find(n=>(bone[n].humanoid||n)===h);}
+const v3=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];          // 差（vdot / vcross / vnorm / qMul は上の共通関数）
+const hpAxisQ=(ax,deg)=>qAxis(deg,ax[0],ax[1],ax[2]);     // 軸（単位ベクトル）まわり deg 度 [w,x,y,z]
+function applyHandPose(){
+  const side=fingerSide,hand=hpFind(side+"Hand");if(!hand)return;
+  const n=[0,-1,0],hp=hpRestPos(hand);
+  const mid=hpFind(side+"MiddleProximal")||hpFind(side+"IndexProximal");
+  const handDir=mid?vnorm(v3(hpRestPos(mid),hp)):[side==="Left"?-1:1,0,0];
+  const th=hpFind(side+"ThumbProximal");
+  let t=th?v3(hpRestPos(th),hp):[0,0,1];
+  t=v3(t,handDir.map(x=>x*vdot(t,handDir)));t=v3(t,n.map(x=>x*vdot(t,n)));
+  t=Math.hypot(t[0],t[1],t[2])>1e-6?vnorm(t):[0,0,1];
+  const edited=[];
+  const noThumb=document.getElementById("hpNoThumb").checked;
+  for(const [f] of HP_FINGERS){
+    if(noThumb&&f==="Thumb")continue;
+    const js=[...HP_JOINTS.map(j=>hpFind(side+f+j)),hpFind(side+f+"Tip")];
+    for(let k=0;k<3;k++){
+      const b=js[k];if(!b)continue;
+      const nx=js[k+1],pv=k>0?js[k-1]:hand;
+      const d=nx?vnorm(v3(hpRestPos(nx),hpRestPos(b))):vnorm(v3(hpRestPos(b),hpRestPos(pv)));
+      let curl=hpVal.grip*HP.grip.curl[f][k]+hpVal.relax*HP.relax.curl[f][k];
+      HP_SIGNS.forEach((sg,i)=>{curl+=hpVal.signs[i]*sg.curl[f]*HP.grip.curl[f][k];});
+      let q=hpAxisQ(vnorm(vcross(d,n)),curl);
+      if(k===0){let spr=hpVal.spread*HP.spread.spread[f]+hpVal.relax*HP.relax.spread[f];
+        HP_SIGNS.forEach((sg,i)=>{spr+=hpVal.signs[i]*sg.spread[f];});q=qMul(hpAxisQ(vnorm(vcross(d,t)),spr),q);}
+      bone[b].euler=quatToEuler(q);onBoneEdited(b,true);edited.push(b);
+    }
+  }
+  if(bqAuto)flushPose();
+  solve();buildSliders();draw();updatePanels();
+}
+function buildHandPoseTable(){
+  const rows=HP_FINGERS.map(([f,jp])=>`<tr><th>${jp}</th>`+
+    [0,1,2].map(k=>`<td><input data-p="grip" data-f="${f}" data-k="${k}" value="${HP.grip.curl[f][k]}"></td>`).join("")+
+    [0,1,2].map(k=>`<td><input data-p="relax" data-f="${f}" data-k="${k}" value="${HP.relax.curl[f][k]}"></td>`).join("")+
+    `<td><input data-p="spread" data-f="${f}" value="${HP.spread.spread[f]}"></td>`+
+    `<td><input data-p="relaxSpread" data-f="${f}" value="${HP.relax.spread[f]}"></td></tr>`).join("");
+  const el=document.getElementById("hpTable");
+  el.innerHTML=`<table><tr><th></th><th colspan="3">握る：曲げ</th><th colspan="3">力を抜く：曲げ</th><th>広げる</th><th>抜く：開き</th></tr>`+
+    `<tr><th></th><th>付根</th><th>中</th><th>先</th><th>付根</th><th>中</th><th>先</th><th>付根</th><th>付根</th></tr>${rows}</table>`;
+  el.querySelectorAll("input").forEach(inp=>inp.onchange=()=>{const v=+inp.value;if(!Number.isFinite(v)){inp.value=0;return;}
+    const f=inp.dataset.f,k=+inp.dataset.k,p=inp.dataset.p;
+    if(p==="grip")HP.grip.curl[f][k]=v;else if(p==="relax")HP.relax.curl[f][k]=v;
+    else if(p==="spread")HP.spread.spread[f]=v;else HP.relax.spread[f]=v;
+    applyHandPose();});
+}
+[["hpGrip","grip"],["hpSpread","spread"],["hpRelax","relax"]].forEach(([id,key])=>{
+  const r=document.getElementById(id),v=document.getElementById(id+"V");
+  r.oninput=()=>{hpVal[key]=+r.value;v.textContent=(+r.value).toFixed(2);applyHandPose();};
+});
+[1,2,3,4,5].forEach(i=>{
+  const r=document.getElementById("hpSign"+i),v=document.getElementById("hpSign"+i+"V");
+  r.oninput=()=>{hpVal.signs[i-1]=+r.value;v.textContent=(+r.value).toFixed(2);applyHandPose();};
+});
+function buildSignTable(){
+  const el=document.getElementById("hpSignTable");
+  const head=`<tr><th></th>${[1,2,3,4,5].map(i=>`<th colspan="2">${i}</th>`).join("")}</tr>`+
+             `<tr><th></th>${[1,2,3,4,5].map(()=>"<th>曲げ</th><th>開き</th>").join("")}</tr>`;
+  const rows=HP_FINGERS.map(([f,jp])=>`<tr><th>${jp}</th>`+HP_SIGNS.map((sg,i)=>
+    `<td><input data-i="${i}" data-f="${f}" data-t="curl" value="${sg.curl[f]}"></td><td><input data-i="${i}" data-f="${f}" data-t="spread" value="${sg.spread[f]}"></td>`).join("")+"</tr>").join("");
+  el.innerHTML=`<table>${head}${rows}</table>`;
+  el.querySelectorAll("input").forEach(inp=>inp.onchange=()=>{const v=+inp.value;if(!Number.isFinite(v)){inp.value=0;return;}
+    HP_SIGNS[+inp.dataset.i][inp.dataset.t][inp.dataset.f]=v;applyHandPose();});
+}
+buildHandPoseTable();buildSignTable();
+modePresetBtn.onclick=()=>setMode("preset");
+modeAllBtn.onclick=()=>setMode("all");
+modeFingerBtn.onclick=()=>setMode("finger");
+document.getElementById("fingerLeft").onclick=()=>{if(editMode!=="finger"||!fingerTabs("Left").length)return;enterFinger("Left");editBone=EDIT[0];setEditTab(editBone);selected=editBone;selSet=new Set([selected]);buildSliders();refresh();emitBones();};
+document.getElementById("fingerRight").onclick=()=>{if(editMode!=="finger"||!fingerTabs("Right").length)return;enterFinger("Right");editBone=EDIT[0];setEditTab(editBone);selected=editBone;selSet=new Set([selected]);buildSliders();refresh();emitBones();};
+document.getElementById("resetEdit").onclick=()=>{
+  if(editMode==="preset"||editMode==="finger"){ EDIT.forEach(n=>{bone[n].euler=[0,0,0];onBoneEdited(n,true);}); }
+  else { bone[editBone].euler=[0,0,0]; if(bone[editBone].parent===null) bone[editBone].move=[0,0,0]; onBoneEdited(editBone,true); }
+  if(bqAuto)flushPose();
+  solve();buildSliders();draw();updatePanels();
+};
+document.getElementById("resetAll").onclick=()=>{
+  order.forEach(n=>{bone[n].euler=[0,0,0];bone[n].move=[0,0,0];onBoneEdited(n,true);});
+  if(bqAuto)flushPose();
+  solve();buildSliders();draw();updatePanels();
+};
+
+const inspectSel=document.getElementById("inspectSel");
+order.forEach(n=>{const o=document.createElement("option");o.value=n;o.textContent=bone[n].jp+"  ("+n+")";inspectSel.appendChild(o);});
+inspectSel.value=selected;
+inspectSel.onchange=()=>{selected=inspectSel.value;selSet=new Set([selected]);if(EDIT.includes(selected))setEditTab(selected);refresh();emitBones();};
+
+document.querySelectorAll("#viewbar [data-view]").forEach(btn=>{
+  btn.onclick=()=>{const v=VIEWS[btn.dataset.view];cam.setView(v[0],v[1],0);autoFitView();   // 向きを変えて全体表示
+    const rs=document.getElementById("rollSld");if(rs)rs.value=0;
+    document.getElementById("rollVal").textContent="0°";
+    document.querySelectorAll("#viewbar [data-view]").forEach(x=>x.classList.remove("on"));
+    btn.classList.add("on");draw();};
+});
+document.getElementById("rollSld").oninput=function(){
+  cam.rotZ=+this.value;document.getElementById("rollVal").textContent=(+this.value).toFixed(0)+"°";draw();};
+document.getElementById("tgAxis").onclick=function(){showAxis=!showAxis;this.classList.toggle("on",showAxis);draw();};
+document.getElementById("tgLabel").onclick=function(){showLabel=!showLabel;this.classList.toggle("on",showLabel);draw();};
+document.getElementById("tgHandle").onclick=function(){handleMode=!handleMode;this.classList.toggle("on",handleMode);draw();};
+
+/* ===================== panels ===================== */
+const f=(x)=>{const s=(Math.abs(x)<1e-9?0:x).toFixed(3);return (x>=0?" ":"")+s;};
+function matTable(m,isWorld){
+  let h='<table class="matrix">';
+  for(let i=0;i<4;i++){h+="<tr>";
+    for(let j=0;j<4;j++){
+      let cls = (i<3&&j<3)?"r" : (i<3&&j===3)?"t" : "b";
+      h+=`<td class="${cls}">${f(m[i*4+j])}</td>`;
+    }h+="</tr>";}
+  return h+"</table>";
+}
+function quatHTML(q){
+  const lab=["w","x","y","z"];const mag=Math.hypot(...q);
+  return q.map((v,i)=>`<span><span class="lab">${lab[i]}</span> <span class="qc">${f(v)}</span></span>`).join("")
+    +`<span><span class="lab">|q|</span> <span class="qc">${mag.toFixed(4)}</span></span>`;
+}
+function chainHTML(n){
+  const path=[];let c=n;while(c){path.push(c);c=bone[c].parent;}path.reverse();
+  const prod=path.map(p=>p===n?`<span class="me">${bone[p].jp}.local</span>`:`<b>${bone[p].jp}</b>.local`).join(" · ");
+  return `${bone[n].jp}.world = ${prod}<br><span style="color:var(--txt2)">= 親.world · ${bone[n].jp}.local</span>`;
+}
+function updatePanels(){
+  const b=bone[selected];
+  document.getElementById("quatBox").innerHTML=quatHTML(b.q);
+  document.getElementById("localMat").innerHTML=matTable(b.local,false);
+  const pLab=document.getElementById("parentMatLab");
+  const pBox=document.getElementById("parentMat");
+  if(b.parent){
+    pLab.innerHTML=`親の ワールド 4×4 行列 &nbsp;<span style="color:var(--accent)">${bone[b.parent].jp}</span>.world`;
+    pBox.innerHTML=matTable(bone[b.parent].world,true);
+  }else{
+    pLab.innerHTML=`親の ワールド 4×4 行列 &nbsp;<span style="color:var(--txt2)">親なし → 単位行列 I を使用</span>`;
+    pBox.innerHTML=matTable(mat4Id(),true);
+  }
+  document.getElementById("worldMat").innerHTML=matTable(b.world,true);
+  document.getElementById("chainBox").innerHTML=chainHTML(selected);
+  document.getElementById("parentPill").textContent =
+    b.parent? "親: "+bone[b.parent].jp : "root（親なし）";
+}
+function refresh(){solve();draw();updatePanels();}
+
+/* ===================== 選択共有 + WSクライアント ===================== */
+function syncSelToUI(){                                  // primary選択をUIに反映
+  inspectSel.value=selected;
+  if(editMode==="all"){editBone=selected;editSel.value=selected;buildSliders();}
+  else if(EDIT.includes(selected))setEditTab(selected);
+}
+function resolveBone(name){                              // 受信名→ボーン名（英名/humanoid/jpで解決）
+  if(bone[name])return name;
+  for(const n of order)if(bone[n].humanoid===name)return n;   // 正規名(Humanoid)一致＝Neck→首 等
+  for(const n of order)if(bone[n].jp===name)return n;
+  for(const n of order)if(bone[n].jp.replace(/（.*?）/g,"")===name)return n;
+  return null;
+}
+function emitBones(){                                    // 選択ボーンを共有（英名で送る）
+  cwsSend({type:"state",what:"bones",names:[...selSet],primary:selected});
+}
+function setBonesRemote(names){                          // 受信した選択を反映（送出しない）
+  const valid=[...new Set((names||[]).map(resolveBone).filter(Boolean))];
+  if(!valid.length)return;
+  selSet=new Set(valid); selected=valid[0];
+  syncSelToUI(); refresh();
+}
+
+/* ---- ポーズ（関節角）の双方向同期 ---- */
+let bqAuto=true, _bqRemote=false; const bqDirty=new Set();
+function bqRotXYZW(n){const q=bone[n].q; return [q[1],q[2],q[3],q[0]];}   // [w,x,y,z]→[x,y,z,w]
+function onBoneEdited(name,defer){                        // 関節が編集された
+  if(_bqRemote)return;
+  bqDirty.add(name);
+  if(bqAuto&&!defer)flushPose();
+}
+// ─────────────────────────────────────────────────────────────
+// WebSocket ポーズ・プロトコル（単発・1フレーム分のライブポーズ）
+//   送受信: { type:"pose", bones:{ "<name>": { rot:[x,y,z,w], pos:[x,y,z] } }, frame? }
+//   ※ これはモーション“ファイル”形式ではない。新しいスパース・モーション仕様
+//      （bones:[ {name, rot:[{f,v}], pos:[{f,v}]} ], morphs:[…]）とは別物で、
+//      ここでは「名前→単一ポーズ」を1メッセージで送る。
+//      値の並び（rot=[x,y,z,w], pos=[x,y,z]）は新仕様のキー値 v と同一なので相互変換は容易。
+//      ポーズ・プロトコル自体は今回変更しない。
+// ─────────────────────────────────────────────────────────────
+function flushPose(){                                     // 溜まった編集ボーンをまとめて送出
+  if(!bqDirty.size)return;
+  const out={};
+  bqDirty.forEach(n=>{const key=bone[n].humanoid||n;        // 正規名が分かればNeck等で送る（タイムラインで首=Neckに集約）
+    const o={rot:bqRotXYZW(n)}; if(bone[n].parent===null)o.pos=bone[n].move.slice(); out[key]=o;});
+  cwsSend({type:"pose",bones:out});
+  bqDirty.clear();
+}
+function applyRemotePose(bones,frame){                    // 受信したポーズを関節角へ反映
+  if(!bones)return; _bqRemote=true;
+  for(const nm in bones){const bn=resolveBone(nm);if(!bn)continue;
+    const rot=bones[nm].rot;
+    if(Array.isArray(rot)&&rot.length===4){const q=[rot[3],rot[0],rot[1],rot[2]];bone[bn].euler=quatToEuler(q);}
+    if(Array.isArray(bones[nm].pos)&&bone[bn].parent===null)bone[bn].move=bones[nm].pos.slice();}
+  if(typeof frame==="number")document.getElementById("cFrame").textContent=frame;
+  buildSliders(); refresh(); _bqRemote=false;
+}
+
+let cws=null;
+function cwsRoom(){return (document.getElementById("cId").value||"").trim()||"S0000";}
+function cwsStatus(s){const d=document.getElementById("cDot");
+  d.style.color=s==="on"?"#4ade80":s==="connecting"?"#ffd166":"var(--txt2)";
+  document.getElementById("cBtn").textContent=(s==="on"||s==="connecting")?"切断":"接続";}
+function cwsSend(o){if(cws&&cws.readyState===1){try{cws.send(JSON.stringify(o));}catch(e){}}}
+/* ===== 受信した skeleton を反映：骨格(bone/order)を実モデルのレストで組み直す（Aポーズ等） =====
+   ・off(親ローカルレスト位置)= pos(子) - pos(親)（PMXレスト回転=identity 前提）。root は pos そのまま。
+   ・回転(euler)は scale 不変なので pose 共有(回転)には影響しない。寸法差は表示(zoom/pan)のオートフィットで吸収。
+   ・skeleton 未受信時は内蔵T-poseのまま（フォールバック）。bone/order/EDIT は const なのでミューテートで再構築。 */
+let pmxSkel=null;
+function rebuildBoneUI(){
+  editTabsEl.innerHTML="";
+  EDIT.forEach(n=>{ if(!bone[n])return; const btn=document.createElement("button");btn.textContent=bone[n].jp;
+    btn.onclick=()=>{setEditTab(n);selected=n;selSet=new Set([n]);inspectSel.value=n;refresh();emitBones();};
+    btn.dataset.b=n;editTabsEl.appendChild(btn);});
+  editSel.innerHTML=""; inspectSel.innerHTML="";
+  order.forEach(n=>{ if(!fingerInfo(n)){const o1=document.createElement("option");o1.value=n;o1.textContent=bone[n].jp+"  ("+n+")";editSel.appendChild(o1);}
+                     const o2=document.createElement("option");o2.value=n;o2.textContent=bone[n].jp+"  ("+n+")";inspectSel.appendChild(o2);});
+  if(bone[editBone])editSel.value=editBone;
+  if(bone[selected])inspectSel.value=selected;
+  [...editTabsEl.children].forEach(b=>b.classList.toggle("on",b.dataset.b===editBone));
+}
+function autoFitView(){            // PolyLing の ResetToMesh と同じ：注視点 = 骨格の範囲の中心、距離 = 範囲の対角 × 1.5
+  if(!order.length)return;
+  const mn=[1e9,1e9,1e9],mx=[-1e9,-1e9,-1e9];
+  order.forEach(n=>{const p=bone[n].pos;for(let i=0;i<3;i++){mn[i]=Math.min(mn[i],p[i]);mx[i]=Math.max(mx[i],p[i]);}});
+  cam.fit([0,1,2].map(i=>(mn[i]+mx[i])/2),Math.max(1e-3,Math.hypot(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2])));
+}
+function applySkeleton(skel){
+  if(!skel||!Array.isArray(skel.bones)||!skel.bones.length)return;
+  const pos={}; skel.bones.forEach(b=>{ if(b&&b.name)pos[b.name]=b.pos||[0,0,0]; });
+  for(const k in bone)delete bone[k]; order.length=0;
+  skel.bones.forEach(b=>{ if(!b||!b.name)return;
+    const p=pos[b.name]||[0,0,0];
+    const hasPar=!!(b.parent&&pos[b.parent]);
+    const pp=hasPar?pos[b.parent]:null;
+    const off=pp?[p[0]-pp[0],p[1]-pp[1],p[2]-pp[2]]:[p[0],p[1],p[2]];   // 親ローカルレスト位置
+    bone[b.name]={name:b.name,parent:hasPar?b.parent:null,off,jp:b.name,euler:[0,0,0],move:[0,0,0],humanoid:b.humanoid||null};
+    order.push(b.name);
+  });
+  EDIT.length=0;   // 編集タブ = humanoid を持つ骨（無ければ先頭数本）。全骨はセレクトで選べる
+  const hb=skel.bones.filter(b=>b&&b.humanoid&&bone[b.name]&&!FINGER_RE.test(b.humanoid)).map(b=>b.name);
+  (hb.length?hb:order.slice(0,Math.min(8,order.length))).forEach(n=>EDIT.push(n));
+  if(!bone[selected])selected=EDIT[0]||order[0]||null;
+  if(!bone[editBone])editBone=EDIT[0]||order[0]||null;
+  presetEdit=null; editTabsEl.classList.remove("finger");
+  selSet=new Set(selected?[selected]:[]); pmxSkel=skel;
+  rebuildBoneUI(); solve(); updateFingerButton(); setMode("all"); autoFitView(); buildSliders(); draw(); updatePanels();
+}
+
+function cwsConnect(){
+  const url=document.getElementById("cUrl").value.trim();if(!url)return;
+  try{cws=new WebSocket(url);}catch(e){cws=null;return;}
+  cwsStatus("connecting");
+  const tmo=setTimeout(()=>{if(cws&&cws.readyState!==1){try{cws.close();}catch(e){}cws=null;cwsStatus("off");}},8000);
+  cws.onopen=()=>{clearTimeout(tmo);cwsStatus("on");
+    cwsSend({type:"hello",role:"bonematrix",name:"bonematrix",id:cwsRoom()});emitBones();};
+  cws.onclose=()=>{clearTimeout(tmo);cws=null;cwsStatus("off");};
+  cws.onerror=()=>{};
+  cws.onmessage=ev=>{let m;try{m=JSON.parse(ev.data);}catch(e){return;}
+    if(m.type==="state"){
+      if(m.what==="bones"&&Array.isArray(m.names))setBonesRemote(m.names);
+      else if(m.what==="frame"&&typeof m.frame==="number")document.getElementById("cFrame").textContent=m.frame;
+    }else if(m.type==="pose"){ applyRemotePose(m.bones,m.frame); }
+    else if(m.type==="skeleton"&&Array.isArray(m.bones)){ applySkeleton(m); }   // 共有された骨格を反映（Aポーズ等）
+  };
+}
+function cwsDisconnect(){if(cws){try{cws.close();}catch(e){}}cws=null;cwsStatus("off");}
+document.getElementById("cBtn").onclick=()=>{cws?cwsDisconnect():cwsConnect();};
+document.getElementById("cId").onchange=()=>{if(cws&&cws.readyState===1)
+  cwsSend({type:"hello",role:"bonematrix",name:"bonematrix",id:cwsRoom()});};
+document.getElementById("cAuto").onchange=function(){bqAuto=this.checked;};
+document.getElementById("cApply").onclick=()=>flushPose();
+cwsStatus("off");
+
+/* ===================== boot ===================== */
+window.addEventListener("resize",resize);
+new ResizeObserver(()=>resize()).observe(cv);
+solve();autoFitView();updateFingerButton();draw();   // 起動時は骨格全体が収まる位置から   // 起動後に表示サイズだけが変わったとき（画面の分割など）も描画サイズを合わせる。ずれるとマウス位置がずれる
+setEditTab("LeftUpperArm");
+updateResetLabel();
+solve();
+resize();
+updatePanels();
+</script>
+
+<style>
+  #collab{display:none!important}
+  header{padding:6px 12px}
+  header p{display:none}
+  #right{padding-bottom:16px}
+</style>
+<script>
+(() => {
+  const nativeSend = cwsSend;
+  cwsSend = function(payload){
+    nativeSend(payload);
+    parent.postMessage({app:'MotionStudio',from:'bone',payload}, '*');
+  };
+  window.addEventListener('message', ev => {
+    const m = ev.data;
+    if(!m || m.app!=='MotionStudio' || m.to!=='bone') return;
+    if(m.command==='auto'){
+      bqAuto=!!m.value;
+      const el=document.getElementById('cAuto'); if(el)el.checked=bqAuto;
+      return;
+    }
+    if(m.command==='apply'){ flushPose(); return; }
+    if(m.command==='reset'){ document.getElementById('resetAll').click(); return; }
+    const p=m.payload||{};
+    if(p.type==='state'){
+      if(p.what==='bones'&&Array.isArray(p.names))setBonesRemote(p.names);
+      else if(p.what==='frame'&&typeof p.frame==='number')document.getElementById('cFrame').textContent=p.frame;
+    }else if(p.type==='pose'){
+      // reset:true … 新しいモーションを読み込んだ直後。全ボーンを T ポーズに戻してから当てる（タイムラインへは送り返さない）
+      if(p.reset) order.forEach(n=>{bone[n].euler=[0,0,0];bone[n].move=[0,0,0];});
+      applyRemotePose(p.bones,p.frame);
+    }
+    else if(p.type==='skeleton'&&Array.isArray(p.bones)) applySkeleton(p);
+  });
+  requestAnimationFrame(() => {
+    parent.postMessage({app:'MotionStudio',from:'bone',ready:true}, '*');
+    emitBones();
+  });
+})();
+</script>
+
+</body>
+</html>

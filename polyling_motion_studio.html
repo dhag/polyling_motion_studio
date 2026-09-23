@@ -1,0 +1,218 @@
+<!doctype html>
+<!--
+================================================================================
+ モーションスタジオ（外側の画面）  polyling_motion_studio.html
+--------------------------------------------------------------------------------
+ 役割
+   ・上部のボタン（再生・キー登録・PolyLing 読込/保存・Undo など）と、上下 2 画面の配置。
+   ・2 つの画面を iframe で読み、画面同士のメッセージを中継する。
+     自分では姿勢もキーも持たない。
+ ファイル構成（3 つを同じフォルダに置き、このファイルを開く）
+   polyling_motion_studio.html … この画面
+   bone_editor.html   … 左上：ボーン編集（骨格を回して姿勢を作る）
+   vrm_viewer.html    … 右上：VRM 表示（姿勢を VRM で見るだけ。何も送り返さない）
+   muscle_pose.js     … マッスル → 骨の回転の変換（timeline.html が使う。VRMA 保存と姿勢の送信の両方）
+   polyling_camera.js … PolyLing と同じ視点操作（bone_editor.html と vrm_viewer.html が共通で使う）
+   polyling_live.js   … PolyLing のライブ受信の配信（WebSocket）を受ける（この画面が使う）
+   timeline.html      … 下：タイムライン（キーとクリップの編集・再生・保存）
+ メッセージ（すべて window.postMessage。共通して app:'MotionStudio' を付ける）
+   外側 → 画面（to:'bone' / to:'timeline'）
+     {command:'auto', value:bool}        → bone      自動キー（姿勢を変えたらタイムラインへ送る）の入/切
+     {command:'apply'}                   → bone      今の姿勢をタイムラインへ送る
+     {command:'frame', value:n}          → timeline  n フレームへ移動
+     {command:'step',  value:±n}         → timeline  n フレーム進む/戻る
+     {command:'play'|'key'|'delete'|'fit'|'undo'|'redo'} → timeline
+     {command:'plLoadText', text, name}  → timeline  外側で開いた .plmotion.json の中身
+     {command:'plSave'}                  → timeline  中身を {file:{name,text}} で返させ、外側が保存する
+     {command:'vrmaLoadData', buffer, name} → timeline  外側で開いた .vrma の中身（タイムラインを置き換える）
+     {command:'vrmaSave'}                → timeline  中身を {file:{name,buffer,mime}} で返させ、外側が保存する
+       ※ ファイル選択と保存は、利用者が操作した画面でしか開けない（ブラウザの制限）。
+         各画面は別ファイルなので、外側のボタンから中の画面のファイル選択は開けない。だから外側で行う。
+     {command:'loadVrm', buffer, name}   → vrm       VRM ファイルの中身（上部の「VRM読込」）
+     {payload:…}                         → 相手側    下の payload をそのまま中継（type:'pose' は vrm にも送る）
+   画面 → 外側（from:'bone' / from:'timeline' / from:'vrm'）
+     {ready:true}                        起動完了。bone と timeline がそろうと「統合同期 ON」。
+                                         vrm の ready では、タイムラインに今のフレームの姿勢を出し直させる
+     {state:{frame,playing,canUndo,canRedo,…}}   (timeline のみ) 上部の表示を更新
+     {file:{name,text か buffer,mime?}}  (timeline のみ) plSave / vrmaSave の結果。外側がダウンロードさせる
+     {payload:{type:…}}                  外側はもう一方の画面へ中継する
+       type:'pose'     {bones:{名前:{rot:[x,y,z,w],pos?:[x,y,z]}}, frame}  姿勢（両方向）
+       type:'skeleton' {bones:[{name,parent,pos,humanoid}]}               骨格（timeline → bone）
+       type:'state' / 'hello' / 'bonemap'                                  WebSocket 連携用。中継されるが相手は使わないものもある
+   各画面は単独でも開ける（その場合は WebSocket 連携の元の動作になる）。
+ ライブ受信（上部の「受信開始」）
+   PolyLing の「ライブ受信」の配信（既定 ws://localhost:12361/）へつなぐ。こちらからは何も送らない。
+   届いた {type:'muscles'} を muscle_pose.js で骨の回転に直し、{payload:{type:'pose'}} として bone と vrm へ送る
+   （表示だけ。タイムラインには書き込まない）。腰の位置の倍率は、受信開始後に最初に届いたフレームの RootT を
+   基準にする（タイムライン再生の sendPose と同じ決め方）。中身の振り分けは polyling_live.js が type で行う。
+================================================================================
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PolyLing Motion Studio — MMD風ボーン・タイムライン統合編集</title>
+<style>
+:root{--bg:#080c13;--panel:#101722;--panel2:#151e2c;--line:#26354b;--text:#cfdae9;--dim:#77869c;--cyan:#38bdf8;--amber:#fbbf24;--green:#4ade80;--rose:#fb7185}
+*{box-sizing:border-box}html,body{height:100%;margin:0}body{display:flex;flex-direction:column;overflow:hidden;background:var(--bg);color:var(--text);font:12px system-ui,-apple-system,"Segoe UI","Yu Gothic",sans-serif}
+#studioBar{height:42px;flex:none;display:flex;align-items:center;gap:6px;padding:5px 9px;background:linear-gradient(#151e2c,#0f1621);border-bottom:1px solid var(--line);box-shadow:0 2px 10px #0008;z-index:5}
+.brand{font-weight:700;letter-spacing:.04em;margin-right:8px;white-space:nowrap}.brand b{color:var(--cyan)}.sep{width:1px;height:24px;background:var(--line);margin:0 3px}.sp{flex:1}
+button,input{font:inherit;color:var(--text);background:#121c29;border:1px solid var(--line);border-radius:5px;height:29px}button{padding:0 10px;cursor:pointer}button:hover{border-color:var(--cyan);color:#fff}button.primary{border-color:var(--cyan);color:var(--cyan)}button.danger:hover{border-color:var(--rose);color:var(--rose)}
+#frame{width:64px;text-align:center;font:600 13px ui-monospace,Consolas,monospace;color:var(--amber)}.label{color:var(--dim);white-space:nowrap}.toggle{display:flex;align-items:center;gap:4px;color:var(--dim);white-space:nowrap}.toggle input{height:auto;accent-color:var(--cyan)}
+#status{min-width:90px;color:var(--dim);text-align:right}.ok{color:var(--green)!important}
+#workspace{flex:1;min-height:0;display:flex;flex-direction:column}.pane{position:relative;min-height:100px}.pane iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#0d1117}.paneTag{position:absolute;z-index:2;right:10px;top:7px;padding:3px 8px;background:#07101bcc;border:1px solid #2a405a;border-radius:12px;color:#8da0b8;pointer-events:none;font-size:10px;letter-spacing:.08em}
+#posePane{height:56%;display:flex}.sub{position:relative;flex:1 1 0;min-width:120px}#boneSub{flex:0 0 58%}.vsplit{width:8px;flex:none;cursor:ew-resize;background:#0b111a;border-left:1px solid var(--line);border-right:1px solid var(--line)}.vsplit:hover{background:#12202e}#timelinePane{flex:1}.split{height:8px;flex:none;cursor:ns-resize;background:#0b111a;border-top:1px solid var(--line);border-bottom:1px solid var(--line);position:relative}.split:after{content:"";position:absolute;width:46px;height:2px;background:#3b4b61;border-radius:2px;left:50%;top:2px;transform:translateX(-50%)}.split:hover:after{background:var(--cyan)}
+#help{position:fixed;inset:42px 0 0;background:#05080dcc;display:none;z-index:20;place-items:center}#help.on{display:grid}.helpBox{width:min(680px,90vw);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;box-shadow:0 20px 60px #000}.helpBox h2{margin:0 0 12px;color:var(--cyan);font-size:16px}.helpBox table{width:100%;border-collapse:collapse}.helpBox td{padding:6px 8px;border-bottom:1px solid #202c3c}.helpBox td:first-child{color:var(--amber);white-space:nowrap}.helpBox p{line-height:1.7;color:var(--dim)}
+@media(max-width:900px){.brand{display:none}#status{display:none}button{padding:0 7px}.label.hideSmall{display:none}}
+</style>
+</head>
+<body>
+<div id="studioBar">
+  <div class="brand"><b>PolyLing </b>Motion Studio</div>
+  <button id="prev" title="1フレーム戻る（←）">◀</button>
+  <button id="play" class="primary" title="再生／停止（Space）">▶</button>
+  <button id="next" title="1フレーム進む（→）">▶</button>
+  <span class="label">フレーム</span><input id="frame" type="number" min="0" value="0">
+  <div class="sep"></div>
+  <button id="key" class="primary" title="アクティブなトラックへ現在姿勢のキーを登録（K）">◆ キー登録</button>
+  <button id="del" class="danger" title="選択キー／クリップを削除（Delete）">削除</button>
+  <button id="undo" title="編集を元に戻す（Ctrl+Z）" disabled>↶</button>
+  <button id="redo" title="編集をやり直す（Ctrl+Y）" disabled>↷</button>
+  <label class="toggle" title="ボーン操作を現在フレームへ即時反映"><input id="auto" type="checkbox" checked>自動キー</label>
+  <button id="apply" title="自動キーOFF時のボーン変更を反映">姿勢を反映</button>
+  <div class="sep"></div>
+  <button id="fit" title="タイムライン全体を表示">全体表示</button>
+  <button id="load" title="現行PolyLingMotion v1/v2を読み込む">PolyLingモーション読込</button>
+  <button id="save" title="現行PolyLingMotion v2を保存">PolyLingモーション保存</button>
+  <div class="sep"></div>
+  <button id="vrmLoad" title="VRM モデルを右上に表示する（見るだけ。左の骨格は変わらない）">VRMモデル読込</button>
+  <button id="vrmaLoad" title="VRMA を読み込む（タイムラインを置き換える）">VRMAモーション読込</button>
+  <button id="vrmaSave" title="タイムラインを VRMA として保存する（Humanoid の回転・腰の移動・表情）">VRMAモーション保存</button>
+  <input id="vrmaFile" type="file" accept=".vrma,.glb" style="display:none">
+  <input id="vrmFile" type="file" accept=".vrm" style="display:none">
+  <input id="plFile" type="file" accept=".json,.plmotion.json,application/json" style="display:none">
+  <div class="sep"></div>
+  <input id="liveUrl" type="text" value="ws://localhost:12361/" title="PolyLing のライブ受信の配信先（パネルの配信ポート）" style="width:170px">
+  <button id="liveBtn" title="PolyLing のライブ受信の配信を受けて、姿勢を表示する（タイムラインには書き込まない）">受信開始</button>
+  <div class="sp"></div>
+  <span id="status">読込中…</span>
+  <button id="helpBtn">操作</button>
+</div>
+<div id="workspace">
+  <section class="pane" id="posePane">
+    <div class="sub" id="boneSub"><span class="paneTag">POSE / FK</span><iframe id="boneFrame" src="bone_editor.html" title="ボーン姿勢編集"></iframe></div>
+    <div class="vsplit" id="vsplit" title="ドラッグして左右サイズ変更"></div>
+    <div class="sub" id="vrmSub"><span class="paneTag">VRM</span><iframe id="vrmFrame" src="vrm_viewer.html" title="VRM 表示"></iframe></div>
+  </section>
+  <div class="split" id="split" title="ドラッグして上下サイズ変更"></div>
+  <section class="pane" id="timelinePane"><span class="paneTag">DOPE SHEET / CLIPS</span><iframe id="timelineFrame" src="timeline.html" title="モーションタイムライン"></iframe></section>
+</div>
+<div id="help"><div class="helpBox">
+  <h2>MMD風の基本操作</h2>
+  <table>
+    <tr><td>姿勢を作る</td><td>上の骨格で関節をドラッグするか、右側のXYZスライダを使う。</td></tr>
+    <tr><td>フレーム移動</td><td>下の目盛をクリックする。上部のフレーム欄、← → キーでも移動できる。</td></tr>
+    <tr><td>キー登録</td><td>自動キーONなら姿勢変更時に登録される。OFFなら「キー登録」で未反映の姿勢もまとめて登録する。</td></tr>
+    <tr><td>キー編集</td><td>トラックの ▸ を開き、菱形キーをドラッグする。矩形選択、コピー、貼り付け、Deleteに対応する。</td></tr>
+    <tr><td>クリップ編集</td><td>棒の中央をドラッグして移動、両端をドラッグして長さ変更。重ね合わせ、ループ、ウェイトも使える。</td></tr>
+    <tr><td>視点操作</td><td>左右の画面とも PolyLing と同じ。右ドラッグ=回転、Alt+右ドラッグ=視線まわりの回転、中ドラッグ=平行移動、ホイール=拡大縮小。Shift で速く、Ctrl で遅く。</td></tr>
+    <tr><td>VRM表示</td><td>「VRM読込」でモデルを右上に表示する。見るだけで、左の骨格やタイムラインは変わらない。Unity の Humanoid 名（Hips など）の骨だけが動く。</td></tr>
+    <tr><td>VRMA入出力</td><td>「VRMA読込」はタイムラインを置き換える。「VRMA保存」は Humanoid の骨の回転・腰の移動・表情を毎フレームで書き出す（マッスルだけのモーションは回転に直して書く）。書き出しの基準の骨格はボーン編集の内蔵 T ポーズ。</td></tr>
+    <tr><td>ライブ受信</td><td>PolyLing の「ライブ受信」を受け入れ許可にしてから「受信開始」を押すと、PolyLing が受けたマッスルの姿勢を上の 2 画面に表示する。表示だけで、タイムラインには書き込まない。接続先は PolyLing のパネルの配信ポートに合わせる。</td></tr>
+    <tr><td>PolyLing入出力</td><td>.plmotion.json（v1/v2）を読み込み、現行v2で保存する。秒とフレームはfpsで相互変換する。接線とラップモードは保持して書き戻す。動かしていないキーは元の秒のまま書き出す。</td></tr>
+  </table>
+  <p>PolyLingの位置・スケール・表情・マッスルは線形補間、回転はSlerpである。接線付きカーブは接線を保持して保存するが、接線の編集と、接線を使った再生はまだできない（再生は線形）。ボーン選択・フレーム・ポーズはページ内で直接同期するため、ローカルWebSocketサーバは不要である。</p>
+  <div style="text-align:right"><button id="helpClose" class="primary">閉じる</button></div>
+</div></div>
+<script src="muscle_pose.js"></script>
+<script src="polyling_live.js"></script>
+<script>
+const boneFrame=document.getElementById('boneFrame'),timelineFrame=document.getElementById('timelineFrame'),vrmFrame=document.getElementById('vrmFrame');
+const ready={bone:false,timeline:false,vrm:false};
+const frames={bone:boneFrame,timeline:timelineFrame,vrm:vrmFrame};
+function to(which,msg,transfer){const f=frames[which];if(f&&f.contentWindow)f.contentWindow.postMessage(Object.assign({app:'MotionStudio',to:which},msg),'*',transfer||[]);}
+function updateReady(){const el=document.getElementById('status');const ok=ready.bone&&ready.timeline;el.textContent=ok?'統合同期 ON':'読込中…';el.classList.toggle('ok',ok);if(ok){to('timeline',{command:'frame',value:+document.getElementById('frame').value||0});}}
+window.addEventListener('message',e=>{
+  const m=e.data;if(!m||m.app!=='MotionStudio')return;
+  if(m.ready){ready[m.from]=true;if(m.from==='vrm'){if(ready.timeline)to('timeline',{command:'frame',value:+document.getElementById('frame').value||0});}else updateReady();}
+  if(m.state&&m.from==='timeline'){
+    document.getElementById('frame').value=m.state.frame;
+    document.getElementById('play').textContent=m.state.playing?'⏸':'▶';
+    document.getElementById('undo').disabled=!m.state.canUndo;
+    document.getElementById('redo').disabled=!m.state.canRedo;
+  }
+  if(m.file&&m.from==='timeline'){const a=document.createElement('a');
+    const blob=m.file.buffer?new Blob([m.file.buffer],{type:m.file.mime||'application/octet-stream'}):new Blob([m.file.text],{type:'application/json;charset=utf-8'});
+    a.href=URL.createObjectURL(blob);a.download=m.file.name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
+  if(m.payload){
+    if(m.from==='bone')to('timeline',{payload:m.payload});
+    else if(m.from==='timeline')to('bone',{payload:m.payload});
+    if(m.payload.type==='pose'&&(m.from==='bone'||m.from==='timeline'))to('vrm',{payload:m.payload});   // VRM は見るだけ
+  }
+});
+const cmd=(command,value)=>to('timeline',{command,value});
+document.getElementById('prev').onclick=()=>cmd('step',-1);document.getElementById('next').onclick=()=>cmd('step',1);
+document.getElementById('play').onclick=()=>cmd('play');document.getElementById('key').onclick=()=>{to('bone',{command:'apply'});setTimeout(()=>cmd('key'),0)};
+document.getElementById('del').onclick=()=>cmd('delete');document.getElementById('fit').onclick=()=>cmd('fit');document.getElementById('load').onclick=()=>plFile.click();document.getElementById('save').onclick=()=>cmd('plSave');
+document.getElementById('undo').onclick=()=>cmd('undo');document.getElementById('redo').onclick=()=>cmd('redo');
+document.getElementById('frame').onchange=e=>cmd('frame',Math.max(0,+e.target.value||0));
+document.getElementById('auto').onchange=e=>to('bone',{command:'auto',value:e.target.checked});
+document.getElementById('apply').onclick=()=>to('bone',{command:'apply'});
+const plFile=document.getElementById('plFile');
+plFile.onchange=()=>{const f=plFile.files&&plFile.files[0];plFile.value='';if(!f)return;
+  f.text().then(text=>to('timeline',{command:'plLoadText',text,name:f.name}));};
+const vrmaFile=document.getElementById('vrmaFile');
+document.getElementById('vrmaLoad').onclick=()=>vrmaFile.click();
+vrmaFile.onchange=()=>{const f=vrmaFile.files&&vrmaFile.files[0];vrmaFile.value='';if(!f)return;
+  f.arrayBuffer().then(buf=>to('timeline',{command:'vrmaLoadData',buffer:buf,name:f.name},[buf]));};
+document.getElementById('vrmaSave').onclick=()=>cmd('vrmaSave');
+const vrmFile=document.getElementById('vrmFile');
+document.getElementById('vrmLoad').onclick=()=>vrmFile.click();
+vrmFile.onchange=()=>{const f=vrmFile.files&&vrmFile.files[0];vrmFile.value='';if(!f)return;
+  f.arrayBuffer().then(buf=>{to('vrm',{command:'loadVrm',buffer:buf,name:f.name},[buf]);
+    to('timeline',{command:'frame',value:+document.getElementById('frame').value||0});});};   // 読んだら今のフレームの姿勢を出し直させる
+/* ===== ライブ受信（PolyLing → WebSocket → 表示）===== */
+const LIVE_REST_HIPS_Y=1.0;   // ボーン編集の内蔵骨格の腰の高さ（timeline.html の REST_HIPS_Y と同じ）
+let liveRootT0=null;           // 受信開始後、最初に届いたフレームの RootT（腰の位置の倍率の基準）
+let liveFirst=true;            // 次の姿勢で T ポーズに戻させる（前の姿勢の骨が残らないように）
+const liveBtn=document.getElementById('liveBtn');
+const live=PolyLingLive.create({
+  muscles:m=>{
+    const mv=Object.assign({},m.muscles||{});
+    if(Array.isArray(m.rootQ)&&m.rootQ.length===4)['x','y','z','w'].forEach((k,i)=>mv['RootQ.'+k]=+m.rootQ[i]);
+    if(Array.isArray(m.rootT)&&m.rootT.length===3)['x','y','z'].forEach((k,i)=>mv['RootT.'+k]=+m.rootT[i]);
+    if(!liveRootT0&&Array.isArray(m.rootT)&&m.rootT.length===3)liveRootT0=m.rootT.map(Number);
+    const mb=window.MusclePose.musclesToBones(mv),bones={},msg={type:'pose',bones};
+    for(const n in mb){const o={rot:mb[n].rot};
+      if(n==='Hips'&&mb.Hips.rootT&&liveRootT0&&Math.abs(liveRootT0[1])>1e-4){const k=LIVE_REST_HIPS_Y/liveRootT0[1],t=mb.Hips.rootT;
+        o.pos=[t[0]*k,t[1]*k-LIVE_REST_HIPS_Y,t[2]*k];o.rootT=t.slice();msg.rootT0=liveRootT0.slice();}
+      bones[n]=o;}
+    if(liveFirst){msg.reset=true;liveFirst=false;}
+    to('bone',{payload:msg});to('vrm',{payload:msg});
+  },
+},{
+  onState:s=>{liveBtn.textContent=(s==='on'||s==='connecting')?'受信停止':'受信開始';liveBtn.classList.toggle('primary',s==='on');
+    document.getElementById('liveUrl').disabled=(s!=='off');},
+  onLog:t=>{document.getElementById('status').textContent=t;},
+});
+liveBtn.onclick=()=>{if(live.connected){live.disconnect();return;}
+  liveRootT0=null;liveFirst=true;live.connect(document.getElementById('liveUrl').value.trim());};
+const help=document.getElementById('help');document.getElementById('helpBtn').onclick=()=>help.classList.add('on');document.getElementById('helpClose').onclick=()=>help.classList.remove('on');help.onclick=e=>{if(e.target===help)help.classList.remove('on')};
+window.addEventListener('keydown',e=>{if(/input|textarea/i.test(e.target.tagName))return;const mod=e.ctrlKey||e.metaKey;if(mod&&e.key.toLowerCase()==='z'){e.preventDefault();cmd(e.shiftKey?'redo':'undo')}else if(mod&&e.key.toLowerCase()==='y'){e.preventDefault();cmd('redo')}else if(e.code==='Space'){e.preventDefault();cmd('play')}else if(e.key==='ArrowLeft')cmd('step',e.shiftKey?-10:-1);else if(e.key==='ArrowRight')cmd('step',e.shiftKey?10:1);else if(e.key==='k'||e.key==='K')cmd('key');else if(e.key==='Delete')cmd('delete')});
+const vsplit=document.getElementById('vsplit'),boneSub=document.getElementById('boneSub');
+vsplit.addEventListener('mousedown',e=>{e.preventDefault();const sx=e.clientX,sw=boneSub.getBoundingClientRect().width,pw=document.getElementById('posePane').getBoundingClientRect().width-8;
+  document.querySelectorAll('iframe').forEach(f=>f.style.pointerEvents='none');
+  const mm=ev=>{boneSub.style.flex='0 0 '+Math.max(120,Math.min(pw-120,sw+ev.clientX-sx))+'px'};
+  const mu=()=>{removeEventListener('mousemove',mm);removeEventListener('mouseup',mu);document.querySelectorAll('iframe').forEach(f=>f.style.pointerEvents='')};
+  addEventListener('mousemove',mm);addEventListener('mouseup',mu)});
+const split=document.getElementById('split'),pose=document.getElementById('posePane'),work=document.getElementById('workspace');
+// 境界のドラッグ中は画面（iframe）がマウスを横取りしないようにする。横取りされると外側に動きも離しも届かず、
+// 境界が付いてこない・ボタンを離しても追いかけ続ける、という動きになる。
+split.addEventListener('mousedown',e=>{e.preventDefault();const sy=e.clientY,sh=pose.getBoundingClientRect().height,wh=work.getBoundingClientRect().height-8;
+  document.querySelectorAll('iframe').forEach(f=>f.style.pointerEvents='none');
+  const mm=ev=>{const h=Math.max(130,Math.min(wh-130,sh+ev.clientY-sy));pose.style.height=h+'px'};
+  const mu=()=>{removeEventListener('mousemove',mm);removeEventListener('mouseup',mu);document.querySelectorAll('iframe').forEach(f=>f.style.pointerEvents='')};
+  addEventListener('mousemove',mm);addEventListener('mouseup',mu)});
+</script>
+</body>
+</html>

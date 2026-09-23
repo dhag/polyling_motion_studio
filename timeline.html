@@ -1,0 +1,2055 @@
+<!doctype html>
+<!--
+================================================================================
+ タイムライン  timeline.html   （motion_studio.html の下半分に読み込まれる）
+--------------------------------------------------------------------------------
+ 役割: キーとクリップの編集・再生、PolyLing モーション（.plmotion.json）の読込と保存。単独で開いても使える。
+ 外側とのやり取り（このファイル末尾の <script> で行う。一覧は motion_studio.html の先頭）
+   送る : {from:'timeline', ready:true, state} / {from:'timeline', state} / {from:'timeline', payload:{type:'pose'|'skeleton'|…}}
+          pose の bones にはマッスルトラックから直した骨の回転も入る（腰は rootT も付き、msg.rootT0 = 先頭フレームの RootT）。
+          新しいモーションを読み込んだ直後の pose には reset:true が付く（受け手は T ポーズに戻してから当てる）
+          （WebSocket 送信 wsSend をそのまま外側にも流している）
+   受ける: {to:'timeline', command:'frame'|'step'|'play'|'key'|'delete'|'fit'|'undo'|'redo'|'plSave'}
+          {to:'timeline', command:'plLoadText', text, name}   外側が開いた .plmotion.json の中身
+          {to:'timeline', command:'vrmaLoadData', buffer, name}  外側が開いた .vrma の中身（タイムラインを置き換える）
+          {to:'timeline', command:'vrmaSave'}
+   plSave / vrmaSave には {from:'timeline', file:{name, text か buffer, mime?}} で中身を返す（保存は外側が行う）
+          {to:'timeline', payload:{type:'pose'|'skeleton'|…}}
+================================================================================
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MotionTimeline — モーションデータ管理フレームワーク</title>
+<!--
+================================================================================
+ MotionTimeline.js  —  framework core (window.MotionTimeline / window.tl)
+ 構造:  Timeline ─ Group[] / Track[] ─ Clip[](=パッケージ) ─ keys{channel:[Keyframe]}
+   ・パッケージ層 : クリップを棒(ガント)として配置/移動/伸縮/コピー&ペースト/重畳
+   ・フレーム層   : クリップを展開しドープシートでキーフレームを編集
+   ・グループ層   : 複数トラックをまとめて開閉(右腕/右ひじ/右手首 等)
+ 値の型: 'quat'[x,y,z,w] / 'vec3'[x,y,z] / 'scalar'(number)
+================================================================================
+-->
+<style>
+  :root{
+    --bg:#0b0f17; --panel:#131a26; --panel2:#0e141f; --rail:#0a0e16;
+    --bd:#1f2a3a; --bd2:#2a3a52; --grid:#161f2e; --grid2:#1d2940;
+    --tx:#cdd7e6; --dim:#6b7a90; --dim2:#46566c;
+    --cy:#38bdf8; --tl:#2dd4bf; --amber:#fbbf24; --rose:#fb7185; --pink:#f472b6;
+    --sel:#fbbf24;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:13px;
+       overflow:hidden;display:flex;flex-direction:column;height:100vh}
+
+  .bar{display:flex;align-items:center;gap:6px;padding:7px 10px;background:var(--panel2);
+       border-bottom:1px solid var(--bd);flex-wrap:wrap}
+  .bar .title{font-weight:600;letter-spacing:.04em;margin-right:6px}
+  .bar .title b{color:var(--cy)}
+  .bar .sp{flex:1}
+  button,select{font-family:inherit;font-size:12px;color:var(--tx);background:var(--panel);
+       border:1px solid var(--bd2);border-radius:6px;padding:5px 9px;cursor:pointer;line-height:1}
+  button:hover{border-color:var(--cy);color:#fff}
+  button:active{transform:translateY(1px)}
+  button:disabled{opacity:.4;cursor:default;border-color:var(--bd)}
+  button.ico{padding:5px 8px;min-width:30px}
+  button.pri{background:linear-gradient(180deg,#0e2230,#0b1a26);border-color:var(--cy);color:var(--cy)}
+  .read{font-family:var(--mono);font-size:12px;color:var(--dim);padding:0 4px}
+  .read b{color:var(--amber)}
+  .grp{display:flex;align-items:center;gap:4px;padding:2px 6px;border:1px solid var(--bd);
+       border-radius:7px;background:var(--rail)}
+  .bar input.wsid{font-family:var(--mono);font-size:11px;color:var(--cy);background:var(--bg);
+       border:1px solid var(--bd2);border-radius:5px;padding:4px 6px;width:62px;text-align:center;outline:none;letter-spacing:.5px}
+  .bar input.wsid:focus{border-color:var(--cy)}
+  .bar input.wsurl{font-family:var(--mono);font-size:11px;color:var(--tx);background:var(--bg);
+       border:1px solid var(--bd2);border-radius:5px;padding:4px 7px;width:200px;outline:none}
+  .bar input.wsurl:focus{border-color:var(--cy)}
+  .wsdot{font-size:12px;color:var(--dim2);padding:0 2px}
+  .reclab{display:flex;align-items:center;gap:3px;font-size:11px;color:var(--dim);cursor:pointer;user-select:none}
+  .reclab input{accent-color:#fb7185}
+
+  .main{flex:1;display:flex;min-height:0}
+  .tl-wrap{flex:1;display:flex;min-width:0;border-right:1px solid var(--bd)}
+  .heads{width:200px;flex:none;background:var(--panel2);border-right:1px solid var(--bd);position:relative;overflow:hidden}
+  .corner{position:absolute;top:0;left:0;right:0;height:30px;z-index:3;display:flex;align-items:center;
+          justify-content:space-between;padding:0 6px 0 10px;color:var(--dim);font-size:11px;
+          letter-spacing:.08em;background:var(--rail);border-bottom:1px solid var(--bd)}
+  .corner button{padding:3px 6px;font-size:11px}
+  .heads-inner{position:absolute;top:30px;left:0;right:0;bottom:0;overflow:hidden}
+  .heads-rows{position:absolute;top:0;left:0;right:0;will-change:transform}
+
+  .head{display:flex;align-items:center;gap:6px;padding:0 6px 0 0;border-bottom:1px solid var(--bd);
+        position:relative;overflow:hidden}
+  .head.ingrp{padding-left:14px}
+  .head.ingrp::before{content:"";position:absolute;left:7px;top:0;bottom:0;width:1px;background:var(--bd2)}
+  .head .swatch{width:4px;align-self:stretch;flex:none}
+  .head .twist{width:15px;height:15px;flex:none;display:grid;place-items:center;color:var(--dim);
+        cursor:pointer;border-radius:4px;font-size:9px}
+  .head .twist:hover{background:#1c2738;color:var(--tx)}
+  .head .nm{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+  .head .nm .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:text;border-radius:3px}
+  .head .nm .t:hover{background:#172132;box-shadow:0 0 0 1px var(--bd2) inset}
+  .head .nm .ty{font-family:var(--mono);font-size:9.5px;color:var(--dim2);letter-spacing:.05em}
+  .head .gbtn,.head .del{flex:none;color:var(--dim);font-size:11px;cursor:pointer;width:16px;
+        text-align:center;border-radius:4px;opacity:.55}
+  .head .act{flex:none;width:14px;text-align:center;font-size:10px;color:var(--dim2);cursor:pointer;border-radius:3px}
+  .head .act:hover{background:#15222b;color:var(--tl)}
+  .head.active{background:linear-gradient(90deg,rgba(56,189,248,.12),transparent 70%)}
+  .head.active .swatch{box-shadow:0 0 8px var(--cy)}
+  .head.active .act{color:var(--cy)}
+  .head:hover .gbtn,.head:hover .del{opacity:1}
+  .head .gbtn:hover{color:var(--tl);background:#15222b}
+  .head .del:hover{color:var(--rose)}
+
+  .ghead{display:flex;align-items:center;gap:6px;padding:0 6px 0 8px;border-bottom:1px solid var(--bd);
+         background:linear-gradient(180deg,#162234,#101a28)}
+  .ghead .gtwist{width:16px;height:16px;flex:none;display:grid;place-items:center;color:var(--cy);
+        cursor:pointer;font-size:10px;border-radius:4px}
+  .ghead .gtwist:hover{background:#1c2b40}
+  .ghead .gsw{width:9px;height:9px;border-radius:2px;flex:none}
+  .ghead .gnm{flex:1;min-width:0;font-weight:600;font-size:12px;white-space:nowrap;overflow:hidden;
+        text-overflow:ellipsis;cursor:text;border-radius:3px;padding:1px 3px}
+  .ghead .gnm:hover{background:#1b2940}
+  .ghead .gcnt{font-family:var(--mono);font-size:9.5px;color:var(--dim);flex:none}
+  .ghead .gdel{flex:none;color:var(--dim);font-size:11px;cursor:pointer;width:16px;text-align:center;opacity:.5}
+  .ghead:hover .gdel{opacity:1}
+  .ghead .gdel:hover{color:var(--rose)}
+
+  .nameedit{width:100%;background:var(--rail);border:1px solid var(--cy);color:#fff;border-radius:4px;
+        padding:2px 5px;font-family:var(--sans);font-size:12px}
+
+  .canvas-wrap{flex:1;display:flex;flex-direction:column;min-width:0}
+  .cv-area{position:relative;flex:1;min-height:0;overflow:hidden}
+  canvas{display:block;position:absolute;inset:0;width:100%;height:100%}
+  .hscroll{position:relative;flex:none;height:12px;background:var(--rail);border-top:1px solid var(--bd)}
+  .hthumb{position:absolute;top:2px;height:8px;min-width:24px;border-radius:4px;background:#26384f;cursor:grab}
+  .hthumb:hover{background:#33486a}.hthumb:active{cursor:grabbing;background:var(--cy)}
+  .vscroll{position:absolute;top:30px;right:0;bottom:0;width:12px;z-index:2}
+  .vthumb{position:absolute;right:2px;width:8px;min-height:24px;border-radius:4px;background:#26384f;cursor:grab}
+  .vthumb:hover{background:#33486a}.vthumb:active{cursor:grabbing;background:var(--cy)}
+
+  .side{width:286px;flex:none;background:var(--panel2);display:flex;flex-direction:column;min-height:0}
+  .sec{border-bottom:1px solid var(--bd);display:flex;flex-direction:column;min-height:0}
+  .sec>h3{margin:0;padding:8px 12px;font-size:11px;letter-spacing:.1em;color:var(--dim);
+          background:var(--rail);font-weight:600;display:flex;align-items:center;gap:8px}
+  .sec>h3 .tag{font-family:var(--mono);color:var(--cy);letter-spacing:0}
+  .insp{padding:10px 12px;overflow:auto;max-height:46vh}
+  .hint{color:var(--dim2);font-size:12px;line-height:1.6}
+  .row{display:flex;align-items:center;gap:8px;margin:6px 0}
+  .row label{width:64px;flex:none;color:var(--dim);font-size:11px}
+  .row input[type=text],.row input[type=number]{flex:1;min-width:0;background:var(--rail);
+      border:1px solid var(--bd);color:var(--tx);border-radius:5px;padding:4px 7px;
+      font-family:var(--mono);font-size:12px}
+  .row input[type=range]{flex:1;accent-color:var(--cy)}
+  .row .v{font-family:var(--mono);font-size:11px;color:var(--amber);width:40px;text-align:right}
+  .chan{margin-top:8px;padding-top:8px;border-top:1px dashed var(--bd)}
+  .chan .cl{font-family:var(--mono);font-size:10.5px;color:var(--tl);letter-spacing:.04em;margin-bottom:3px}
+  .triplet{display:flex;gap:5px}
+  .triplet input{flex:1;width:0;background:var(--rail);border:1px solid var(--bd);color:var(--tx);
+      border-radius:5px;padding:3px 5px;font-family:var(--mono);font-size:11px;text-align:right}
+  .ibtns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+  .ibtns button{flex:1;min-width:62px}
+
+  .pose{padding:8px 12px;overflow:auto;flex:1}
+  .pose table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}
+  .pose td{padding:3px 4px;border-bottom:1px solid var(--bd);vertical-align:top}
+  .pose td.k{color:var(--dim)}
+  .pose td.v{color:var(--tx);text-align:right;white-space:pre}
+  .pose .dot{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:5px;vertical-align:middle}
+
+  .popup{position:fixed;z-index:60;background:var(--panel);border:1px solid var(--bd2);border-radius:8px;
+        padding:4px;box-shadow:0 12px 34px rgba(0,0,0,.55);min-width:150px}
+  .popup .pi{padding:6px 10px;border-radius:5px;cursor:pointer;font-size:12px;white-space:nowrap}
+  .popup .pi:hover{background:#1b2940;color:#fff}
+  .popup .pi.on{color:var(--cy)}
+  .popup .sep{height:1px;background:var(--bd);margin:4px 2px}
+  .setpop{min-width:218px}
+  .setpop .ph{font-weight:600;color:var(--cy);padding:4px 6px 6px;font-size:12px}
+  .setpop .ph2{font-weight:600;color:var(--dim);padding:8px 6px 4px;border-top:1px solid var(--bd);
+        margin-top:4px;display:flex;justify-content:space-between;align-items:center;font-size:11px}
+  .setpop .pr{display:flex;flex-wrap:wrap;gap:5px 10px;align-items:center;padding:4px 6px;font-size:12px}
+  .setpop .pr>span{color:var(--dim);min-width:60px}
+  .setpop label{display:inline-flex;align-items:center;gap:3px;cursor:pointer}
+  .setpop select{background:var(--rail);color:var(--tx);border:1px solid var(--bd);border-radius:5px;
+        padding:2px 4px;font-size:11px;flex:1;min-width:0}
+  .setpop .mini{padding:2px 7px;font-size:10px;border-radius:5px}
+  .setpop input[type=radio]{accent-color:var(--cy)}
+
+  .modal{position:fixed;inset:0;background:rgba(4,7,12,.78);display:none;place-items:center;z-index:50}
+  .modal.on{display:grid}
+  .modal .box{width:min(560px,90vw);background:var(--panel);border:1px solid var(--bd2);border-radius:10px;padding:14px}
+  .modal textarea{width:100%;height:240px;background:var(--rail);color:var(--tx);border:1px solid var(--bd);
+      border-radius:6px;font-family:var(--mono);font-size:11px;padding:8px;resize:vertical}
+  .modal .mb{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}
+  .maphint{font-size:11px;color:var(--dim2);margin-bottom:8px;line-height:1.5}
+  .maptable{max-height:50vh;overflow:auto;border:1px solid var(--bd);border-radius:6px;padding:4px}
+  .maprow{display:grid;grid-template-columns:150px 1fr 18px;gap:8px;align-items:center;padding:2px 4px}
+  .maprow .mapk{font-size:12px;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .maprow .mapv{background:var(--rail);color:var(--tx);border:1px solid var(--bd);border-radius:4px;padding:3px 6px;font-size:12px}
+  .maprow .mapok{font-size:12px;text-align:center;color:var(--dim2)}
+  .maprow .mapok.ok{color:#4ade80}.maprow .mapok.ng{color:#fbbf24}
+
+  #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);opacity:0;
+        background:#12202c;border:1px solid var(--cy);color:#dff1ff;padding:8px 16px;border-radius:8px;
+        font-size:12px;pointer-events:none;transition:.18s;z-index:70}
+  #toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:#1e2a3c;border-radius:6px}
+  ::-webkit-scrollbar-track{background:transparent}
+</style>
+<script src="muscle_pose.js"></script>
+</head>
+<body>
+
+<div class="bar">
+  <div class="title"><b>Motion</b>Timeline</div>
+  <div class="grp">
+    <button class="ico" id="toStart" title="先頭へ">⏮</button>
+    <button class="ico pri" id="play" title="再生/停止 (Space)">▶</button>
+  </div>
+  <div class="read"><b id="curF">0</b> / <span id="totF">0</span> f &nbsp;·&nbsp; <span id="fpsR">30</span>fps</div>
+  <div class="sp"></div>
+  <div class="grp">
+    <span class="read" style="padding:0 2px">zoom</span>
+    <button class="ico" id="zOut">−</button>
+    <button class="ico" id="zIn">＋</button>
+    <button class="ico" id="zFit" title="全体表示">⤢</button>
+  </div>
+  <div class="grp">
+    <button id="addBone">＋ ボーン</button>
+    <button id="addMorph">＋ 表情</button>
+    <button id="expAll">全展開/折畳</button>
+  </div>
+  <div class="grp">
+    <button id="addClipBtn" title="アクティブtrackのplayhead位置に空クリップ">＋クリップ</button>
+    <button id="punchBtn" title="アクティブtrackにキー打ち (K)">キー打ち</button>
+  </div>
+  <div class="grp">
+    <button id="copyBtn" title="Ctrl+C">コピー</button>
+    <button id="pasteBtn" title="Ctrl+V">ペースト</button>
+    <button id="pasteCfg" class="ico" title="ペースト設定（配置・軸反転・貼り付け先）">⚙</button>
+    <button id="bundleBtn" title="選択を縦に束ねる">バンドル化</button>
+  </div>
+  <div class="grp">
+    <button id="plLoadBtn" title="現行PolyLingMotion v1/v2を読み込む">PolyLingモーション読込</button>
+    <input id="plFile" type="file" accept=".json,.plmotion.json,application/json" style="display:none">
+    <button id="plSaveBtn" title="現行PolyLingMotion v2として保存">PolyLingモーション保存</button>
+    <button id="mocapBtn" title="汎用モーションJSONを読み込む（bindPose付きなら自動でマッピング＋リターゲット）">汎用JSON読込</button>
+    <input id="mocapFile" type="file" accept=".json,application/json" style="display:none">
+    <button id="pmxCsvBtn" title="行き先モデルのボーンCSV(PMX/UnityBone)を読み込む。自動でマッピング＋リターゲット">骨CSV読込</button>
+    <input id="pmxCsvFile" type="file" accept=".csv,.txt,text/csv" style="display:none">
+    <button id="exp">JSON保存</button>
+    <input id="srcCsvFile" type="file" accept=".csv,.txt,text/csv" style="display:none">
+    <button id="advToggle" class="ico" title="高度な機能の表示/非表示">⚙ 高度</button>
+    <span id="advTools" style="display:none">
+      <button id="imp" title="JSONをテキストで貼り付け取込">JSON貼付</button>
+      <button id="srcCsvBtn" title="リターゲット元(model1)の骨格CSV。通常はモーションJSONのbindPoseで自動取得されるので不要">ソース骨格</button>
+      <button id="rtgBtn" title="手動でリターゲット（通常は読込時に自動実行）" disabled>リターゲット</button>
+      <button id="rtgUndo" title="リターゲットを元に戻す">元に戻す</button>
+      <button id="mapBtn" title="ボーン対応表（PMX名 ↔ 正規名）">マッピング</button>
+      <button id="mirrorBtn" title="左右ミラー単体（通常はリターゲットが内包）">左右ミラー</button>
+      <button id="pmxSkelDl" title="生成した skeleton.json を保存" disabled>skeleton保存</button>
+    </span>
+  </div>
+  <div class="grp">
+    <span class="wsdot" id="wsDot" title="接続状態">●</span>
+    <input id="wsId" class="wsid" type="text" value="S0000" maxlength="16" title="共有ID：同じIDのクライアントと選択ボーン等のイベントを共有">
+    <input id="wsUrl" class="wsurl" type="text" value="ws://127.0.0.1:8765" placeholder="ws://127.0.0.1:8765">
+    <button id="wsBtn">接続</button>
+    <label class="reclab" title="受信フレームを記録"><input type="checkbox" id="wsRec">REC</label>
+  </div>
+</div>
+
+<div class="main">
+  <div class="tl-wrap">
+    <div class="heads" id="heads">
+      <div class="corner"><span>TRACKS</span></div>
+      <div class="heads-inner"><div class="heads-rows" id="headRows"></div></div>
+    </div>
+    <div class="canvas-wrap" id="cwrap">
+      <div class="cv-area" id="cvArea">
+        <canvas id="cv"></canvas>
+        <div class="vscroll" id="vscroll"><div class="vthumb" id="vthumb"></div></div>
+      </div>
+      <div class="hscroll" id="hscroll"><div class="hthumb" id="hthumb"></div></div>
+    </div>
+  </div>
+
+  <div class="side">
+    <div class="sec">
+      <h3>インスペクタ <span class="tag" id="inspTag"></span></h3>
+      <div class="insp" id="insp"></div>
+    </div>
+    <div class="sec" style="flex:1">
+      <h3>サンプリング出力 <span class="tag">@playhead</span></h3>
+      <div class="pose" id="pose"></div>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="modal">
+  <div class="box">
+    <div style="font-weight:600;margin-bottom:8px" id="modalTitle">JSON</div>
+    <textarea id="ta" spellcheck="false"></textarea>
+    <div class="mb">
+      <button id="mLoad" style="display:none">この内容を読み込む</button>
+      <button id="mDl">ファイル保存</button>
+      <button id="mClose" class="pri">閉じる</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="mapModal">
+  <div class="box">
+    <div style="font-weight:600;margin-bottom:6px">ボーンマッピング（Unity Humanoid → PMXボーン名）</div>
+    <div class="maphint">Unityモーションの各正規名(uname)を、PMXモデルのどのボーンに割り当てるか。PMX骨CSVを読み込むと実モデルのボーン名で自動補完されます（●=モデルに存在 / ?=未検出 / —=未割当）。</div>
+    <div id="mapTable" class="maptable"></div>
+    <datalist id="pmxNameList"></datalist>
+    <div class="mb">
+      <button id="mapAuto">CSVから自動</button>
+      <button id="mapStd">標準MMD名で補完</button>
+      <button id="mapClear">クリア</button>
+      <button id="mapClose" class="pri">閉じる</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+/* ============================================================================ 1. 数学 */
+const M = { clamp:(v,a,b)=>v<a?a:v>b?b:v, lerp:(a,b,t)=>a+(b-a)*t,
+  lerp3:(a,b,t)=>[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t] };
+const Q = {
+  ID:[0,0,0,1],
+  mul(a,b){const[ax,ay,az,aw]=a,[bx,by,bz,bw]=b;return[
+    aw*bx+ax*bw+ay*bz-az*by, aw*by-ax*bz+ay*bw+az*bx,
+    aw*bz+ax*by-ay*bx+az*bw, aw*bw-ax*bx-ay*by-az*bz];},
+  axis(x,y,z,deg){const h=deg*Math.PI/360,s=Math.sin(h);return[x*s,y*s,z*s,Math.cos(h)];},
+  fromEuler(x,y,z){return Q.mul(Q.mul(Q.axis(1,0,0,x),Q.axis(0,1,0,y)),Q.axis(0,0,1,z));},
+  norm(q){const l=Math.hypot(q[0],q[1],q[2],q[3])||1;return[q[0]/l,q[1]/l,q[2]/l,q[3]/l];},
+  toEuler(q){const[x,y,z,w]=Q.norm(q);
+    const sr=2*(w*x+y*z),cr=1-2*(x*x+y*y),roll=Math.atan2(sr,cr);
+    let sp=2*(w*y-z*x);sp=M.clamp(sp,-1,1);const pitch=Math.asin(sp);
+    const sy=2*(w*z+x*y),cy=1-2*(y*y+z*z),yaw=Math.atan2(sy,cy);
+    return[roll*180/Math.PI,pitch*180/Math.PI,yaw*180/Math.PI];},
+  slerp(a,b,t){let[ax,ay,az,aw]=a,[bx,by,bz,bw]=b;let c=ax*bx+ay*by+az*bz+aw*bw;
+    if(c<0){bx=-bx;by=-by;bz=-bz;bw=-bw;c=-c;}
+    if(c>0.9995)return Q.norm([ax+t*(bx-ax),ay+t*(by-ay),az+t*(bz-az),aw+t*(bw-aw)]);
+    const an=Math.acos(c),s=Math.sin(an),t0=Math.sin((1-t)*an)/s,t1=Math.sin(t*an)/s;
+    return[ax*t0+bx*t1,ay*t0+by*t1,az*t0+bz*t1,aw*t0+bw*t1];},
+};
+const KIND = {
+  quat:{rest:()=>[0,0,0,1],mix:(a,b,t)=>Q.slerp(a,b,t),weight:(v,w)=>Q.slerp([0,0,0,1],v,w)},
+  vec3:{rest:()=>[0,0,0],mix:(a,b,t)=>M.lerp3(a,b,t),weight:(v,w)=>[v[0]*w,v[1]*w,v[2]*w]},
+  scale3:{rest:()=>[1,1,1],mix:(a,b,t)=>M.lerp3(a,b,t),weight:(v,w)=>M.lerp3([1,1,1],v,w)},
+  scalar:{rest:()=>0,mix:(a,b,t)=>M.lerp(a,b,t),weight:(v,w)=>v*w},
+};
+
+/* ============================================================================ 2. モデル */
+let _uid=1; const uid=p=>p+(_uid++);
+const TRACK_DEF = {
+  bone:{label:'BONE',channels:[{name:'rot',kind:'quat',label:'回転 (deg)'},{name:'pos',kind:'vec3',label:'位置'},{name:'scl',kind:'scale3',label:'スケール'}]},
+  morph:{label:'EXPR',channels:[{name:'w',kind:'scalar',label:'ウェイト'}]},
+  muscle:{label:'MUSCLE',channels:[{name:'w',kind:'scalar',label:'値'}]},
+};
+
+class Clip {
+  constructor(track,o={}){
+    this.id=o.id||uid('c'); this.track=track;
+    this.name=o.name||'パッケージ'; this.start=o.start||0; this.len=o.len||60;
+    this.loop=o.loop||false; this.weight=o.weight==null?1:o.weight; this.keys={};
+    track.channels.forEach(ch=>this.keys[ch.name]=[]);
+    if(o.keys)for(const k in o.keys)if(this.keys[k])this.keys[k]=o.keys[k].map(x=>{const y={f:x.f,v:x.v};
+      if(x.tan!=null)y.tan=JSON.parse(JSON.stringify(x.tan));if(x.t0!=null)y.t0=x.t0;return y;});   // PolyLing v2 の接線と元時刻を保持
+  }
+  get end(){return this.start+this.len;}
+  keyFrames(){const s=new Set();for(const ch in this.keys)this.keys[ch].forEach(k=>s.add(k.f));return[...s].sort((a,b)=>a-b);}
+  _sort(){for(const ch in this.keys)this.keys[ch].sort((a,b)=>a.f-b.f);}
+  captureKey(lf,pose){lf=Math.round(M.clamp(lf,0,this.len-1));
+    this.track.channels.forEach(ch=>{
+      const v=pose&&pose[ch.name]!==undefined?pose[ch.name]:this.sampleChannel(ch.name,lf);
+      const arr=this.keys[ch.name],ex=arr.find(k=>k.f===lf),val=Array.isArray(v)?v.slice():v;
+      if(ex)ex.v=val;else arr.push({f:lf,v:val});});
+    this._sort();return lf;}
+  removeKeyAt(lf){for(const ch in this.keys)this.keys[ch]=this.keys[ch].filter(k=>k.f!==lf);}
+  moveKey(lf,nlf){nlf=Math.round(M.clamp(nlf,0,this.len-1));
+    if(nlf!==lf&&this.keyFrames().includes(nlf))return lf;
+    for(const ch in this.keys)this.keys[ch].forEach(k=>{if(k.f===lf)k.f=nlf;});this._sort();return nlf;}
+  sampleChannel(name,lf){
+    const def=this.track.channels.find(c=>c.name===name),kd=KIND[def.kind],keys=this.keys[name];
+    if(!keys.length)return kd.rest();
+    if(this.loop&&this.len>0)lf=((lf%this.len)+this.len)%this.len;
+    if(lf<=keys[0].f)return keys[0].v;
+    if(lf>=keys[keys.length-1].f)return keys[keys.length-1].v;
+    for(let i=0;i<keys.length-1;i++){const a=keys[i],b=keys[i+1];
+      if(lf>=a.f&&lf<=b.f){const t=(lf-a.f)/((b.f-a.f)||1);return kd.mix(a.v,b.v,t);}}
+    return keys[keys.length-1].v;}
+  sampleAt(name,f){const def=this.track.channels.find(c=>c.name===name),kd=KIND[def.kind];
+    const v=this.sampleChannel(name,f-this.start);return this.weight>=1?v:kd.weight(v,this.weight);}
+  contains(f){return f>=this.start&&f<this.end;}
+  toJSON(){return{id:this.id,name:this.name,start:this.start,len:this.len,loop:this.loop,weight:this.weight,keys:this.keys};}
+}
+class Track {
+  constructor(tl,o={}){this.id=o.id||uid('t');this.tl=tl;this.type=o.type||'bone';
+    this.channels=(TRACK_DEF[this.type]||TRACK_DEF.bone).channels;this.name=o.name||(this.type==='bone'?'ボーン':this.type==='muscle'?'マッスル':'表情');
+    this.uname=o.uname||null;   // 正規名（共有キー。当面= Unity Humanoid 英名。null なら name を使う）
+    this.plRole=o.plRole||null;this.plTargetKind=o.plTargetKind||null;
+    this.preWrapMode=o.preWrapMode||null;this.postWrapMode=o.postWrapMode||null;
+    this.plCategory=o.plCategory||null;this.plProvider=o.plProvider||null;
+    this.color=o.color||'#38bdf8';this.expanded=o.expanded||false;this.group=o.group||null;
+    this.clips=(o.clips||[]).map(c=>new Clip(this,c));}
+  addClip(o){const c=new Clip(this,o);this.clips.push(c);this.clips.sort((a,b)=>a.start-b.start);return c;}
+  removeClip(c){this.clips=this.clips.filter(x=>x!==c);}
+  sampleContinuous(ch,f){
+    const kd=KIND[ch.kind],all=[];
+    this.clips.forEach((c,ci)=>(c.keys[ch.name]||[]).forEach(k=>{
+      const v=c.weight>=1?k.v:kd.weight(k.v,c.weight);
+      all.push({f:c.start+k.f,v,ci});}));
+    if(!all.length)return kd.rest();
+    all.sort((a,b)=>a.f-b.f||a.ci-b.ci);
+    let prev=null,next=null;
+    for(const k of all){if(k.f<=f)prev=k;if(k.f>=f){next=k;break;}}
+    if(prev&&next){if(prev.f===next.f)return next.v;
+      const t=M.clamp((f-prev.f)/(next.f-prev.f),0,1);return kd.mix(prev.v,next.v,t);}
+    if(prev)return prev.v;                    // 最終キー以降は最後の姿勢を保持
+    return kd.rest();}                        // 最初のキーより前はレスト姿勢
+  sample(f){const act=this.clips.filter(c=>c.contains(f)).sort((a,b)=>a.start-b.start),out={};
+    this.channels.forEach(ch=>{const kd=KIND[ch.kind],chanAct=act.filter(c=>{const ks=c.keys[ch.name]||[];
+        if(!ks.length)return false;if(c.loop)return true;const lf=f-c.start;return lf>=ks[0].f&&lf<=ks[ks.length-1].f;});
+      if(!chanAct.length){out[ch.name]=this.sampleContinuous(ch,f);return;}
+      let acc=chanAct[0].sampleAt(ch.name,f);
+      for(let i=1;i<chanAct.length;i++){const prev=chanAct[i-1],cur=chanAct[i];
+        const ov0=cur.start,ov1=Math.min(prev.end,cur.end);let w=M.clamp((f-ov0)/((ov1-ov0)||1),0,1);
+        acc=kd.mix(acc,cur.sampleAt(ch.name,f),w);}
+      out[ch.name]=acc;});
+    return out;}
+  toJSON(){return{id:this.id,type:this.type,name:this.name,uname:this.uname,color:this.color,expanded:this.expanded,
+    group:this.group,plRole:this.plRole,plTargetKind:this.plTargetKind,preWrapMode:this.preWrapMode,postWrapMode:this.postWrapMode,
+    plCategory:this.plCategory,plProvider:this.plProvider,clips:this.clips.map(c=>c.toJSON())};}
+}
+class Group{constructor(o={}){this.id=o.id||uid('g');this.name=o.name||'グループ';
+  this.color=o.color||'#38bdf8';this.collapsed=o.collapsed||false;}
+  toJSON(){return{id:this.id,name:this.name,color:this.color,collapsed:this.collapsed};}}
+// Bundle = 複数トラックにまたがるクリップ/バンドルを束ねるネスト可能な単位
+class Bundle{constructor(o={}){this.id=o.id||uid('b');this.name=o.name||'バンドル';
+  this.color=o.color||'#a78bfa';this.collapsed=o.collapsed||false;
+  this.clipIds=o.clipIds?[...o.clipIds]:[];   // 直接メンバ(リーフ・クリップ)
+  this.childIds=o.childIds?[...o.childIds]:[]; // 入れ子の子バンドル
+  this.parentId=o.parentId||null;}
+  toJSON(){return{id:this.id,name:this.name,color:this.color,collapsed:this.collapsed,
+    clipIds:this.clipIds,childIds:this.childIds,parentId:this.parentId};}}
+class MotionTimeline {
+  constructor(o={}){this.fps=o.fps||30;this.groups=(o.groups||[]).map(g=>new Group(g));
+    this.tracks=(o.tracks||[]).map(t=>new Track(this,t));
+    this.bundles=(o.bundles||[]).map(b=>new Bundle(b));this.boneMap=o.boneMap||{};
+    this.plMotion=o.plMotion||null;}
+  addTrack(o){const t=new Track(this,o);this.tracks.push(t);return t;}
+  removeTrack(t){this.tracks=this.tracks.filter(x=>x!==t);}
+  addGroup(o){const g=new Group(o);this.groups.push(g);return g;}
+  removeGroup(g){this.groups=this.groups.filter(x=>x!==g);}
+  getGroup(id){return this.groups.find(g=>g.id===id);}
+  addBundle(o){const b=new Bundle(o);this.bundles.push(b);return b;}
+  removeBundle(b){this.bundles=this.bundles.filter(x=>x!==b);}
+  getBundle(id){return this.bundles.find(b=>b.id===id);}
+  findClip(id){for(const t of this.tracks){const c=t.clips.find(c=>c.id===id);if(c)return c;}return null;}
+  trackOfClip(c){return this.tracks.find(t=>t.clips.includes(c));}
+  get length(){let m=120;this.tracks.forEach(t=>t.clips.forEach(c=>m=Math.max(m,c.end)));return Math.ceil((m+30)/30)*30;}
+  sample(f){const o={};this.tracks.forEach(t=>o[t.id]=t.sample(f));return o;}
+  toJSON(){return{fps:this.fps,groups:this.groups.map(g=>g.toJSON()),
+    tracks:this.tracks.map(t=>t.toJSON()),bundles:this.bundles.map(b=>b.toJSON()),boneMap:this.boneMap,plMotion:this.plMotion};}
+  static fromJSON(o){const m=new MotionTimeline(o);bumpUid(m);return m;}
+}
+window.MotionTimeline=MotionTimeline;
+// 読込後にuidカウンタを既存ID超へ進めて衝突回避
+function bumpUid(m){let mx=0;const scan=id=>{const n=parseInt(String(id).replace(/\D/g,''));if(n>mx)mx=n;};
+  m.groups.forEach(g=>scan(g.id));m.bundles.forEach(b=>scan(b.id));
+  m.tracks.forEach(t=>{scan(t.id);t.clips.forEach(c=>scan(c.id));});_uid=Math.max(_uid,mx+1);}
+
+/* ============================================================================ 3. 初期状態 */
+function demo(){
+  return new MotionTimeline({fps:30});   // 空のタイムライン（JSON読込/貼付で自分のデータを使う）
+}
+let tl=demo(); window.tl=tl;
+
+/* グループ補助 */
+function memberTracks(g){return tl.tracks.filter(t=>t.group===g.id);}
+function normalizeOrder(){const out=[],emitted=new Set();
+  for(const t of tl.tracks){if(t.group){if(!emitted.has(t.group)){emitted.add(t.group);
+    out.push(...tl.tracks.filter(x=>x.group===t.group));}}else out.push(t);} tl.tracks=out;}
+
+/* バンドル補助 */
+function bDirectClips(b){return b.clipIds.map(id=>tl.findClip(id)).filter(Boolean);}
+function bChildren(b){return b.childIds.map(id=>tl.getBundle(id)).filter(Boolean);}
+function bAllClips(b){let out=bDirectClips(b);bChildren(b).forEach(ch=>out=out.concat(bAllClips(ch)));return out;}
+function bBounds(b){const cs=bAllClips(b);if(!cs.length)return null;
+  return{start:Math.min(...cs.map(c=>c.start)),end:Math.max(...cs.map(c=>c.end))};}
+function bTracks(b){const set=new Set(),tr=[];bAllClips(b).forEach(c=>{const t=tl.trackOfClip(c);
+  if(t&&!set.has(t.id)){set.add(t.id);tr.push(t);}});
+  return tr.sort((a,b2)=>tl.tracks.indexOf(a)-tl.tracks.indexOf(b2));}
+function bDepth(b){let d=0,p=b.parentId;while(p){d++;p=(tl.getBundle(p)||{}).parentId;}return d;}
+function bTopLevel(){return tl.bundles.filter(b=>!b.parentId);}
+function bClipMember(clip){return tl.bundles.find(b=>b.clipIds.includes(clip.id));} // 直接所属
+function bMoveBy(b,delta){const cs=bAllClips(b);if(!cs.length)return;
+  const mn=Math.min(...cs.map(c=>c.start));if(mn+delta<0)delta=-mn;
+  cs.forEach(c=>c.start+=delta);bTracks(b).forEach(t=>t.clips.sort((a,b2)=>a.start-b2.start));}
+function bSetStart(b,ns){const bd=bBounds(b);if(bd)bMoveBy(b,Math.round(ns)-bd.start);}
+function bClone(b,dStart){const nb=tl.addBundle({name:b.name,color:b.color,collapsed:b.collapsed,parentId:b.parentId});
+  bDirectClips(b).forEach(c=>{const t=tl.trackOfClip(c);
+    const nc=t.addClip({...c.toJSON(),id:undefined,start:c.start+dStart});nb.clipIds.push(nc.id);});
+  bChildren(b).forEach(ch=>{const nch=bClone(ch,dStart);nch.parentId=nb.id;nb.childIds.push(nch.id);});
+  return nb;}
+function bUngroup(b){ // バンドルだけ解除（クリップ/子は残す。子は親へ昇格）
+  bChildren(b).forEach(ch=>ch.parentId=b.parentId);
+  const par=b.parentId&&tl.getBundle(b.parentId);
+  if(par){par.childIds=par.childIds.filter(id=>id!==b.id).concat(b.childIds);}
+  tl.removeBundle(b);}
+function bDeleteWithClips(b){bChildren(b).forEach(ch=>bDeleteWithClips(ch));
+  bDirectClips(b).forEach(c=>{const t=tl.trackOfClip(c);if(t)t.removeClip(c);});
+  const par=b.parentId&&tl.getBundle(b.parentId);if(par)par.childIds=par.childIds.filter(id=>id!==b.id);
+  tl.removeBundle(b);}
+function bMakeFrom(items,name){ // items: [{type:'clip',clip}|{type:'bundle',bundle}]
+  const clipIds=[],childIds=[];
+  items.forEach(it=>{if(it.type==='clip'){const old=bClipMember(it.clip);
+      if(old)old.clipIds=old.clipIds.filter(id=>id!==it.clip.id); clipIds.push(it.clip.id);}
+    else if(it.type==='bundle'){childIds.push(it.bundle.id);}});
+  const col=PAL[(tl.bundles.length+2)%PAL.length];
+  const b=tl.addBundle({name:name||'バンドル',color:col,clipIds,childIds});
+  childIds.forEach(id=>{const ch=tl.getBundle(id);if(ch)ch.parentId=b.id;});
+  return b;}
+
+/* ============================================================================ 4. ビュー */
+const RULER_H=30,GROUP_H=26,ROW_C=42,ROW_X=88,CLIP_H=26;
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+const cwrap=document.getElementById('cwrap'),cvArea=document.getElementById('cvArea'),headRows=document.getElementById('headRows');
+const hscroll=document.getElementById('hscroll'),hthumb=document.getElementById('hthumb'),vscroll=document.getElementById('vscroll'),vthumb=document.getElementById('vthumb');
+const view={start:0,ppf:6}; let playhead=0,playing=false,sel=null,scrollY=0,LAYOUT=[],contentH=0;
+let marked=[]; let BUNDLE_RECTS=[]; let hiddenClips=new Set();
+let activeSet=new Set(); let lastTrack=null; // アクティブtrack（明示・複数）と最後に触ったトラック
+function activeTracks(){return activeSet.size?tl.tracks.filter(t=>activeSet.has(t.id)):(lastTrack?tl.tracks.filter(t=>t.id===lastTrack):[]);}
+function isActive(t){return activeSet.size?activeSet.has(t.id):lastTrack===t.id;}
+function touch(t){if(t)lastTrack=t.id;}
+
+/* ===== イベント/状態レイヤー（WS同期の土台。window.tlEvents / tlState / tlSync で公開）===== */
+const bus={_l:{},on(t,f){(this._l[t]=this._l[t]||[]).push(f);return()=>this.off(t,f);},
+  off(t,f){if(this._l[t])this._l[t]=this._l[t].filter(x=>x!==f);},
+  emit(t,p){(this._l[t]||[]).forEach(f=>{try{f(p);}catch(e){console.error(e);}});
+            (this._l['*']||[]).forEach(f=>{try{f(Object.assign({type:t},p));}catch(e){}});}};
+let _src='local',_lastFrame=null,_lastBones='',_lastSel='',_lastSig='',_dataRev=0;
+function selectedBoneIds(){let ids=[];                       // 選択ボーン＝選択が指すトラック、無ければアクティブtrack
+  if(sel){if(sel.type==='clip'||sel.type==='key'){const t=tl.trackOfClip(sel.clip);if(t)ids=[t.id];}
+    else if(sel.type==='keyset')ids=[...new Set(keySel.map(k=>{const t=tl.trackOfClip(k.clip);return t&&t.id;}))];
+    else if(sel.type==='bundle')ids=bTracks(sel.bundle).map(t=>t.id);}
+  if(!ids.length&&marked.length){const s=new Set();marked.forEach(m=>{if(m.clip){const t=tl.trackOfClip(m.clip);if(t)s.add(t.id);}
+    else if(m.bundle)bTracks(m.bundle).forEach(t=>s.add(t.id));});ids=[...s];}
+  if(!ids.length)ids=activeTracks().map(t=>t.id);
+  return ids.filter(Boolean);}
+function selectionSummary(){
+  if(!sel){if(marked.length)return{kind:'marked',clipIds:marked.filter(m=>m.clip).map(m=>m.clip.id),bundleIds:marked.filter(m=>m.bundle).map(m=>m.bundle.id)};return{kind:'none'};}
+  if(sel.type==='clip')return{kind:'clip',clipId:sel.clip.id};
+  if(sel.type==='key'){const t=tl.trackOfClip(sel.clip);return{kind:'key',trackId:t&&t.id,clipId:sel.clip.id,frame:sel.clip.start+sel.lf};}
+  if(sel.type==='keyset')return{kind:'keyset',count:keySel.length,keys:keySel.map(k=>({clipId:k.clip.id,lf:k.lf}))};
+  if(sel.type==='bundle')return{kind:'bundle',bundleId:sel.bundle.id};
+  return{kind:'none'};}
+function dataSignature(){let s=tl.tracks.length+'|'+tl.bundles.length+'|'+tl.groups.length; // 構造変化の軽量署名
+  tl.tracks.forEach(t=>{s+=';'+t.id+':'+t.clips.length;t.clips.forEach(c=>{s+=','+c.start+'-'+c.len+'-'+c.keyFrames().length;});});return s;}
+function notifyFrame(){const f=Math.round(playhead);if(f!==_lastFrame){_lastFrame=f;bus.emit('frameChange',{frame:f,source:_src});}}
+function notifyEdit(trackId,frame,channel){_dataRev++;bus.emit('keyEdit',{trackId,frame,channel,rev:_dataRev,source:_src});}
+function emitState(){ // refresh毎に差分のみ発火
+  const bk=JSON.stringify(selectedBoneIds());
+  if(bk!==_lastBones){_lastBones=bk;const ids=JSON.parse(bk);
+    bus.emit('boneChange',{ids,names:ids.map(id=>{const t=tl.tracks.find(t=>t.id===id);return t&&t.name;}),source:_src});}
+  const ss=selectionSummary(),sk=JSON.stringify(ss);
+  if(sk!==_lastSel){_lastSel=sk;bus.emit('selectionChange',Object.assign({source:_src},ss));}
+  const sig=dataSignature();if(sig!==_lastSig){_lastSig=sig;_dataRev++;bus.emit('dataChange',{rev:_dataRev,source:_src});}}
+window.tlEvents=bus;
+window.tlState={get frame(){return Math.round(playhead);},get bones(){return selectedBoneIds();},
+  get selection(){return selectionSummary();},get dataRev(){return _dataRev;}};
+window.tlSync={                                              // 外部（WSクライアント等）からの購読・操作
+  on:(t,f)=>bus.on(t,f),
+  setFrame(f){_src='remote';setPlayhead(f);draw();renderPose();_src='local';},
+  selectBones(ids){_src='remote';sel=null;marked=[];keySel=[];activeSet=new Set(ids||[]);lastTrack=(ids&&ids[0])||null;refresh();_src='local';},
+  getState(){return{frame:Math.round(playhead),bones:selectedBoneIds(),selection:selectionSummary(),dataRev:_dataRev};}};
+let keySel=[]; let marquee=null; // キー矩形選択
+function keySelHas(c,lf){return keySel.some(k=>k.clip===c&&k.lf===lf);}
+function keyUnion(base,extra){const out=base.slice();
+  extra.forEach(k=>{if(!out.some(o=>o.clip===k.clip&&o.lf===k.lf))out.push(k);});return out;}
+function keySub(base,rem){return base.filter(o=>!rem.some(k=>k.clip===o.clip&&k.lf===o.lf));}
+function syncKeySel(){sel=keySel.length>1?{type:'keyset'}:keySel.length===1?{type:'key',clip:keySel[0].clip,lf:keySel[0].lf}:null;}
+function keysInRect(r){const out=[],xa=Math.min(r.x0,r.x1),xb=Math.max(r.x0,r.x1),
+  ya=Math.min(r.y0,r.y1),yb=Math.max(r.y0,r.y1);
+  for(const row of LAYOUT){if(row.kind!=='track'||!row.track.expanded)continue;
+    const cy=RULER_H+row.y-scrollY+ROW_C+(ROW_X-ROW_C)/2; if(cy<ya||cy>yb)continue;
+    for(const c of row.track.clips){if(hiddenClips.has(c))continue;
+      for(const lf of c.keyFrames()){const kx=fx(c.start+lf);if(kx>=xa&&kx<=xb)out.push({clip:c,lf});}}}
+  return out;}
+function isMarked(type,ref){return marked.some(m=>m.type===type&&(m.clip===ref||m.bundle===ref));}
+function toggleMark(item){const i=marked.findIndex(m=>m.type===item.type&&(m.clip===item.clip&&m.bundle===item.bundle));
+  if(i>=0)marked.splice(i,1);else marked.push(item);}
+let dpr=1,W=0,H=0;
+function fx(f){return(f-view.start)*view.ppf;} function xf(x){return view.start+x/view.ppf;}
+function rowH(t){return t.expanded?ROW_X:ROW_C;}
+function maxScroll(){return Math.max(0,contentH-(H-RULER_H));}
+
+function layoutRows(){const rows=[];let y=0,seen=new Set();
+  for(const t of tl.tracks){
+    if(t.group){const g=tl.getGroup(t.group);
+      if(g&&!seen.has(g.id)){seen.add(g.id);rows.push({kind:'group',group:g,y,h:GROUP_H});y+=GROUP_H;}
+      if(g&&!g.collapsed){rows.push({kind:'track',track:t,y,h:rowH(t)});y+=rowH(t);}
+    }else{rows.push({kind:'track',track:t,y,h:rowH(t)});y+=rowH(t);}
+  }
+  contentH=y;LAYOUT=rows;return rows;}
+
+function resize(){const r=cvArea.getBoundingClientRect();dpr=window.devicePixelRatio||1;
+  W=r.width;H=r.height;cv.width=W*dpr;cv.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);draw();}
+new ResizeObserver(resize).observe(cvArea);
+function tickStep(){for(const s of[1,2,5,10,15,30,60,120,300,600])if(s*view.ppf>=58)return s;return 600;}
+
+function draw(){
+  scrollY=M.clamp(scrollY,0,maxScroll());
+  ctx.clearRect(0,0,W,H);
+  // ルーラ
+  ctx.fillStyle=getCSS('--rail');ctx.fillRect(0,0,W,RULER_H);
+  const step=tickStep(),f0=Math.floor(view.start/step)*step;
+  ctx.textBaseline='middle';ctx.font='10px '+getCSS('--mono');
+  // 内容クリップ域
+  ctx.save();ctx.beginPath();ctx.rect(0,RULER_H,W,H-RULER_H);ctx.clip();
+  // 縦グリッド
+  for(let f=f0;fx(f)<W+40;f+=step){const x=fx(f);if(x<-2)continue;
+    ctx.strokeStyle=(f%(step*5)===0)?getCSS('--grid2'):getCSS('--grid');
+    ctx.beginPath();ctx.moveTo(x+.5,RULER_H);ctx.lineTo(x+.5,H);ctx.stroke();}
+  // 折りたたみバンドルのメンバ・クリップを非表示に
+  computeHidden();
+  // 行
+  LAYOUT.forEach((r,i)=>{
+    const yT=RULER_H+r.y-scrollY; if(yT>H||yT+r.h<RULER_H)return;
+    if(r.kind==='group')drawGroupRow(r.group,yT);
+    else drawTrackRow(r.track,yT,i);
+  });
+  drawBundles();
+  ctx.restore();
+  // ルーラ数値（最前面）
+  ctx.fillStyle=getCSS('--rail');ctx.fillRect(0,0,W,RULER_H);
+  for(let f=f0;fx(f)<W+40;f+=step){const x=fx(f);if(x<-2)continue;
+    ctx.strokeStyle='#243349';ctx.beginPath();ctx.moveTo(x+.5,RULER_H-6);ctx.lineTo(x+.5,RULER_H);ctx.stroke();
+    ctx.fillStyle=getCSS('--dim');ctx.fillText(f,x+4,RULER_H/2);}
+  ctx.strokeStyle=getCSS('--bd');ctx.beginPath();ctx.moveTo(0,RULER_H+.5);ctx.lineTo(W,RULER_H+.5);ctx.stroke();
+  updateScrollbars();
+  drawPlayhead();
+  if(marquee){const x=Math.min(marquee.x0,marquee.x1),y=Math.max(Math.min(marquee.y0,marquee.y1),RULER_H),
+    w=Math.abs(marquee.x1-marquee.x0),h=Math.abs(marquee.y1-marquee.y0);
+    ctx.fillStyle='rgba(251,191,36,.10)';ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle=getCSS('--sel');ctx.lineWidth=1;ctx.setLineDash([4,3]);ctx.strokeRect(x+.5,y+.5,w,h);ctx.setLineDash([]);}
+}
+function drawGroupRow(g,yT){
+  ctx.fillStyle='#0e1828';ctx.fillRect(0,yT,W,GROUP_H);
+  ctx.fillStyle=hexA(g.color,.8);ctx.fillRect(0,yT,3,GROUP_H);
+  if(g.collapsed){ // 折りたたみ時：子クリップの俯瞰
+    memberTracks(g).forEach(t=>t.clips.forEach(c=>{const x=fx(c.start),w=c.len*view.ppf;
+      if(x+w<0||x>W)return;ctx.fillStyle=hexA(t.color,.55);
+      roundRect(Math.max(x,-3),yT+GROUP_H/2-3,Math.min(x+w,W)-Math.max(x,-3),6,2);ctx.fill();}));
+  }
+  ctx.strokeStyle=getCSS('--bd');ctx.beginPath();ctx.moveTo(0,yT+GROUP_H+.5);ctx.lineTo(W,yT+GROUP_H+.5);ctx.stroke();
+}
+function drawTrackRow(t,yT,i){
+  ctx.fillStyle=i%2?'#0d131e':'#0b1019';ctx.fillRect(0,yT,W,rowH(t));
+  if(t.expanded){ctx.fillStyle='#090d15';ctx.fillRect(0,yT+ROW_C,W,ROW_X-ROW_C);}
+  const laneY=yT+(ROW_C-CLIP_H)/2;
+  t.clips.forEach(c=>{if(hiddenClips.has(c))return;const x=fx(c.start),w=c.len*view.ppf;if(x+w<0||x>W)return;
+    drawClip(c,x,laneY,w,t.color,sel&&sel.type==='clip'&&sel.clip===c);
+    if(isMarked('clip',c)){ctx.setLineDash([4,3]);ctx.lineWidth=1.5;ctx.strokeStyle=getCSS('--sel');
+      roundRect(x-1,laneY-1,w+2,CLIP_H+2,7);ctx.stroke();ctx.setLineDash([]);}
+    if(t.expanded)drawDope(c,x,w,yT+ROW_C,ROW_X-ROW_C,t.color);});
+  ctx.strokeStyle=getCSS('--bd');ctx.beginPath();ctx.moveTo(0,yT+rowH(t)+.5);ctx.lineTo(W,yT+rowH(t)+.5);ctx.stroke();
+}
+function computeHidden(){hiddenClips=new Set();
+  tl.bundles.forEach(b=>{if(b.collapsed)bAllClips(b).forEach(c=>hiddenClips.add(c));});}
+function trackScreen(track){const r=LAYOUT.find(r=>r.kind==='track'&&r.track===track);
+  return r?{top:RULER_H+r.y-scrollY,h:r.h}:null;}
+function drawBundles(){BUNDLE_RECTS=[];bTopLevel().forEach(b=>drawBundle(b));}
+function drawBundle(b){
+  const bd=bBounds(b);if(!bd)return;
+  const tks=bTracks(b).map(t=>trackScreen(t)).filter(Boolean);
+  if(!tks.length){bChildren(b).forEach(drawBundle);return;} // 全メンバ不可視
+  const x=fx(bd.start),w=(bd.end-bd.start)*view.ppf;
+  let top=Math.min(...tks.map(t=>t.top)),bot=Math.max(...tks.map(t=>t.top+t.h));
+  const inset=bDepth(b)*3;
+  const rx=x-3,ry=top+inset-2,rw=w+6,rh=(bot-top)-inset*2+4;
+  const selB=sel&&sel.type==='bundle'&&sel.bundle===b,mk=isMarked('bundle',b);
+  ctx.font='600 10px '+getCSS('--sans');
+  if(b.collapsed){
+    ctx.fillStyle=hexA(b.color,.10);roundRect(rx,ry,rw,rh,7);ctx.fill();
+    drawClip({name:b.name,len:bd.end-bd.start},x,top+(ROW_C-CLIP_H)/2,w,b.color,selB);
+  }else{
+    ctx.lineWidth=selB?2.5:1.5;ctx.strokeStyle=selB?getCSS('--sel'):hexA(b.color,.85);
+    ctx.setLineDash(mk?[5,4]:[]);roundRect(rx,ry,rw,rh,7);ctx.stroke();ctx.setLineDash([]);
+  }
+  // ヘッダ・タブ（掴むと選択/一括移動）
+  const tabW=Math.min(Math.max(ctx.measureText(b.name).width+24,52),Math.max(52,w+6));
+  const tabX=Math.max(rx,0),tabY=Math.max(ry-13,RULER_H+1);
+  ctx.fillStyle=selB?getCSS('--sel'):b.color;roundRect(tabX,tabY,tabW,14,4);ctx.fill();
+  ctx.fillStyle='#08101a';ctx.textBaseline='middle';
+  ctx.fillText((b.collapsed?'▸ ':'▾ ')+b.name,tabX+6,tabY+8);
+  BUNDLE_RECTS.push({b,tab:{x:tabX,y:tabY,w:tabW,h:14},box:{x:rx,y:ry,w:rw,h:rh}});
+  if(!b.collapsed)bChildren(b).forEach(drawBundle);
+}
+function drawClip(c,x,y,w,col,seld){
+  const r=6,x0=Math.max(x,-r),w0=Math.min(x+w,W+r)-x0;ctx.save();
+  roundRect(x0,y,w0,CLIP_H,r);
+  const g=ctx.createLinearGradient(0,y,0,y+CLIP_H);g.addColorStop(0,hexA(col,.34));g.addColorStop(1,hexA(col,.16));
+  ctx.fillStyle=g;ctx.fill();ctx.fillStyle=col;roundRect(x,y,3,CLIP_H,2,true);ctx.fill();
+  ctx.lineWidth=seld?2:1;ctx.strokeStyle=seld?getCSS('--sel'):hexA(col,.7);roundRect(x,y,w,CLIP_H,r);ctx.stroke();
+  ctx.clip();ctx.fillStyle='#eaf1fb';ctx.font='600 11px '+getCSS('--sans');ctx.textBaseline='middle';
+  ctx.fillText(c.name,x+9,y+CLIP_H/2);
+  if(c.loop){ctx.fillStyle=hexA(col,.9);ctx.font='9px '+getCSS('--mono');ctx.fillText('↻',x+w-13,y+8);}
+  if(c.weight<1){ctx.fillStyle=getCSS('--amber');ctx.font='9px '+getCSS('--mono');ctx.fillText('w'+c.weight.toFixed(2),x+9,y+CLIP_H-7);}
+  ctx.restore();
+}
+function drawDope(c,x,w,laneTop,laneH,col){const cy=laneTop+laneH/2;
+  ctx.strokeStyle=hexA(col,.25);ctx.beginPath();ctx.moveTo(Math.max(x,0),cy+.5);ctx.lineTo(Math.min(x+w,W),cy+.5);ctx.stroke();
+  const kfs=c.keyFrames();if(!kfs.length)return;
+  const dense=kfs.length>80||(w/Math.max(1,kfs.length))<3; // 密：モーキャプ等
+  if(dense){ // ストリップ表示（データは生のまま。将来の隠ぺい表示の布石）
+    const x0=fx(c.start+kfs[0]),x1=fx(c.start+kfs[kfs.length-1]),sx=Math.max(x0,-2),sw=Math.min(x1,W+2)-sx;
+    ctx.fillStyle=hexA(col,.5);roundRect(sx,cy-4,Math.max(sw,2),8,3);ctx.fill();
+    keySel.forEach(k=>{if(k.clip!==c)return;const kx=fx(c.start+k.lf);if(kx>=-6&&kx<=W+6)diamond(kx,cy,6,getCSS('--sel'),true);});
+    return;}
+  kfs.forEach(lf=>{const kx=fx(c.start+lf);if(kx<-6||kx>W+6)return;
+    const on=keySelHas(c,lf);diamond(kx,cy,on?6:5,on?getCSS('--sel'):col,on);});}
+function drawPlayhead(){const x=fx(playhead);if(x<-2||x>W+2)return;
+  ctx.strokeStyle=getCSS('--amber');ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x+.5,0);ctx.lineTo(x+.5,H);ctx.stroke();
+  ctx.fillStyle=getCSS('--amber');ctx.beginPath();ctx.moveTo(x-5,0);ctx.lineTo(x+6,0);ctx.lineTo(x+.5,9);ctx.closePath();ctx.fill();}
+function roundRect(x,y,w,h,r,nb){if(!nb)ctx.beginPath();r=Math.min(r,w/2,h/2);
+  ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+function diamond(x,y,s,col,fill){ctx.beginPath();ctx.moveTo(x,y-s);ctx.lineTo(x+s,y);ctx.lineTo(x,y+s);ctx.lineTo(x-s,y);ctx.closePath();
+  ctx.fillStyle=fill?col:'#0b0f17';ctx.fill();ctx.lineWidth=1.5;ctx.strokeStyle=col;ctx.stroke();}
+const _css={};function getCSS(v){return _css[v]||(_css[v]=getComputedStyle(document.documentElement).getPropertyValue(v).trim());}
+function hexA(hex,a){const n=parseInt(hex.slice(1),16);return`rgba(${n>>16&255},${n>>8&255},${n&255},${a})`;}
+
+/* ---- ヘッダ(DOM) ---- */
+function renderHeads(){
+  headRows.style.transform=`translateY(${-scrollY}px)`;
+  headRows.innerHTML='';
+  LAYOUT.forEach(r=>{
+    if(r.kind==='group')headRows.appendChild(groupHeadEl(r.group,r.h));
+    else headRows.appendChild(trackHeadEl(r.track,r.h));
+  });
+}
+function groupHeadEl(g,h){
+  const d=document.createElement('div');d.className='ghead';d.style.height=h+'px';
+  d.innerHTML=`<div class="gtwist">${g.collapsed?'▸':'▾'}</div>
+    <div class="gsw" style="background:${g.color}"></div>
+    <div class="gnm">${esc(g.name)}</div><div class="gcnt">${memberTracks(g).length}</div>
+    <div class="gdel" title="グループ解除">✕</div>`;
+  d.querySelector('.gtwist').onclick=()=>{g.collapsed=!g.collapsed;refresh();};
+  editable(d.querySelector('.gnm'),()=>g.name,v=>g.name=v);
+  d.querySelector('.gdel').onclick=()=>{if(confirm(`グループ「${g.name}」を解除しますか？（トラックは残ります）`)){
+    memberTracks(g).forEach(t=>t.group=null);tl.removeGroup(g);normalizeOrder();refresh();}};
+  return d;
+}
+function trackHeadEl(t,h){
+  const d=document.createElement('div');d.className='head'+(t.group?' ingrp':'')+(isActive(t)?' active':'');d.style.height=h+'px';
+  const pinned=activeSet.has(t.id);
+  d.innerHTML=`<div class="swatch" style="background:${t.color}"></div>
+    <div class="twist">${t.expanded?'▾':'▸'}</div>
+    <div class="act" title="アクティブ（複数可・キー打ち/クリップ作成の対象）">${pinned?'◉':(isActive(t)?'◯':'·')}</div>
+    <div class="nm"><div class="t">${esc(t.name)}</div>
+      <div class="ty">${TRACK_DEF[t.type].label} · ${t.clips.length}clip${t.uname?` · <span style="color:#7dd3fc" title="正規名(uname)">⟶${esc(t.uname)}</span>`:''}</div></div>
+    <div class="gbtn" title="グループ">⊞</div><div class="del" title="トラック削除">✕</div>`;
+  d.querySelector('.twist').onclick=()=>{t.expanded=!t.expanded;refresh();};
+  d.querySelector('.act').onclick=e=>{e.stopPropagation();
+    if(activeSet.has(t.id))activeSet.delete(t.id);else activeSet.add(t.id);refresh();};
+  editable(d.querySelector('.nm .t'),()=>t.name,v=>t.name=v,()=>touch(t));
+  d.querySelector('.gbtn').onclick=e=>{const r=e.target.getBoundingClientRect();groupMenu(t,r.left,r.bottom+4);};
+  d.querySelector('.del').onclick=()=>{if(confirm(`「${t.name}」を削除しますか？`)){
+    const og=t.group;tl.removeTrack(t);activeSet.delete(t.id);if(lastTrack===t.id)lastTrack=null;
+    if(sel&&sel.clip&&sel.clip.track===t)sel=null;
+    if(og&&!memberTracks(tl.getGroup(og)||{id:''}).length){const g=tl.getGroup(og);if(g)tl.removeGroup(g);}
+    normalizeOrder();refresh();}};
+  return d;
+}
+function esc(s){return(s+'').replace(/[<>&]/g,m=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[m]));}
+function editable(el,get,set,onStart){el.title='クリックで名前変更';
+  el.onclick=e=>{e.stopPropagation();if(onStart)onStart();const inp=document.createElement('input');inp.type='text';
+    inp.className='nameedit';inp.value=get();el.replaceWith(inp);inp.focus();inp.select();
+    let done=false;const commit=()=>{if(done)return;done=true;set(inp.value.trim()||get());refresh();};
+    inp.onkeydown=ev=>{if(ev.key==='Enter')inp.blur();else if(ev.key==='Escape'){inp.value=get();inp.blur();}};
+    inp.onblur=commit;};}
+
+/* ---- グループ・メニュー / 汎用ポップアップ ---- */
+function popup(x,y,items){closePopup();const m=document.createElement('div');m.className='popup';
+  items.forEach(it=>{if(it.sep){const s=document.createElement('div');s.className='sep';m.appendChild(s);return;}
+    const b=document.createElement('div');b.className='pi'+(it.on?' on':'');b.textContent=it.label;
+    b.onclick=()=>{closePopup();it.act();};m.appendChild(b);});
+  document.body.appendChild(m);const r=m.getBoundingClientRect();
+  m.style.left=Math.min(x,innerWidth-r.width-8)+'px';m.style.top=Math.min(y,innerHeight-r.height-8)+'px';
+  setTimeout(()=>document.addEventListener('mousedown',closePopup,{once:true}),0);}
+function closePopup(){const e=document.querySelector('.popup');if(e)e.remove();}
+function groupMenu(t,x,y){const items=[];
+  tl.groups.forEach(g=>items.push({label:g.name,on:t.group===g.id,act:()=>assignGroup(t,g.id)}));
+  if(tl.groups.length)items.push({sep:true});
+  items.push({label:'＋ 新規グループにまとめる',act:()=>{const n=prompt('グループ名','グループ');
+    if(n){const g=tl.addGroup({name:n,color:t.color});assignGroup(t,g.id);}}});
+  if(t.group)items.push({label:'グループから外す',act:()=>assignGroup(t,null)});
+  popup(x,y,items);}
+function assignGroup(t,gid){const og=t.group;t.group=gid;normalizeOrder();
+  if(og&&og!==gid){const g=tl.getGroup(og);if(g&&!memberTracks(g).length)tl.removeGroup(g);}refresh();}
+
+/* ============================================================================ 5. マウス操作 */
+let drag=null;
+function rowAtY(y){if(y<RULER_H)return null;const cy=y-RULER_H+scrollY;
+  for(const r of LAYOUT)if(cy>=r.y&&cy<r.y+r.h)return r;return null;}
+function rowTopScreen(r){return RULER_H+r.y-scrollY;}
+function bundleHit(x,y){ // タブ、または折りたたみバンドルの本体
+  for(let k=BUNDLE_RECTS.length-1;k>=0;k--){const R=BUNDLE_RECTS[k];
+    if(x>=R.tab.x&&x<=R.tab.x+R.tab.w&&y>=R.tab.y&&y<=R.tab.y+R.tab.h)return R.b;
+    if(R.b.collapsed&&x>=R.box.x&&x<=R.box.x+R.box.w&&y>=R.box.y&&y<=R.box.y+R.box.h)return R.b;}
+  return null;}
+cv.addEventListener('mousedown',e=>{
+  const{x,y}=mpos(e);
+  if(y<RULER_H){drag={mode:'play'};setPlayhead(xf(x));return;}
+  const keyBase=keySel.slice(),addMode=e.shiftKey,subMode=e.ctrlKey||e.metaKey; // Shift=追加 / Ctrl(Cmd)=除外
+  // バンドル（タブ/折りたたみ本体）優先
+  const hb=bundleHit(x,y);
+  if(hb){if(e.shiftKey){toggleMark({type:'bundle',bundle:hb});sel=null;keySel=[];refresh();return;}
+    sel={type:'bundle',bundle:hb};marked=[];keySel=[];const bd=bBounds(hb);
+    drag={mode:'bundle',bundle:hb,ox:x,obd:bd?bd.start:0};refresh();return;}
+  const r=rowAtY(y);if(!r){sel=null;marked=[];keySel=[];refresh();return;}
+  if(r.kind==='group'){setPlayhead(xf(x));sel=null;marked=[];keySel=[];refresh();return;}
+  const t=r.track,top=rowTopScreen(r);touch(t); // 最後に触ったトラック
+  if(t.expanded&&y>=top+ROW_C){ // キーフレーム・レーン
+    for(const c of t.clips){if(hiddenClips.has(c))continue;for(const lf of c.keyFrames())
+      if(Math.abs(fx(c.start+lf)-x)<6){
+        keySel=addMode?keyUnion(keyBase,[{clip:c,lf}]):subMode?keySub(keyBase,[{clip:c,lf}]):[{clip:c,lf}];
+        marked=[];syncKeySel();
+        if(!addMode&&!subMode)drag={mode:'key',clip:c,lf}; // 無修飾のみ移動ドラッグ
+        refresh();return;}}
+    // 空き → 矩形選択開始（修飾キーで追加/除外）
+    marked=[];marquee={x0:x,y0:y,x1:x,y1:y};drag={mode:'marquee',add:addMode,sub:subMode,base:keyBase};
+    keySel=(addMode||subMode)?keyBase.slice():[];syncKeySel();refresh();return;}
+  const cy=top+(ROW_C-CLIP_H)/2; // クリップ・レーン
+  for(const c of t.clips){if(hiddenClips.has(c))continue;const cx=fx(c.start),cw=c.len*view.ppf;
+    if(y<cy||y>cy+CLIP_H)continue;
+    if(x>=cx-1&&x<=cx+cw+1){
+      if(e.shiftKey){ // 複数選択（縦に束ねる準備）
+        if(marked.length===0&&sel&&sel.type==='clip')toggleMark({type:'clip',clip:sel.clip});
+        toggleMark({type:'clip',clip:c});sel=null;keySel=[];refresh();return;}
+      sel={type:'clip',clip:c};marked=[];keySel=[];
+      if(Math.abs(x-cx)<6)drag={mode:'resizeL',clip:c,ox:x,os:c.start,ol:c.len};
+      else if(Math.abs(x-(cx+cw))<6)drag={mode:'resizeR',clip:c,ox:x,ol:c.len};
+      else drag={mode:'move',clip:c,ox:x,os:c.start};refresh();return;}}
+  sel=null;marked=[];keySel=[];setPlayhead(xf(x));refresh();
+});
+window.addEventListener('mousemove',e=>{if(!drag){hover(e);return;}
+  const p=mpos(e),x=p.x,f=xf(x);
+  if(drag.mode==='play')setPlayhead(f);
+  else if(drag.mode==='marquee'){marquee.x1=x;marquee.y1=p.y;const inr=keysInRect(marquee);
+    keySel=drag.add?keyUnion(drag.base,inr):drag.sub?keySub(drag.base,inr):inr;syncKeySel();}
+  else if(drag.mode==='bundle')bSetStart(drag.bundle,drag.obd+Math.round(f-xf(drag.ox)));
+  else if(drag.mode==='move'){drag.clip.start=Math.max(0,Math.round(drag.os+(f-xf(drag.ox))));drag.clip.track.clips.sort((a,b)=>a.start-b.start);}
+  else if(drag.mode==='resizeR')drag.clip.len=Math.max(1,Math.round(drag.ol+(f-xf(drag.ox))));
+  else if(drag.mode==='resizeL'){const dl=Math.round(f-xf(drag.ox)),ns=Math.max(0,drag.os+dl),nl=drag.ol-(ns-drag.os);
+    if(nl>=1){drag.clip.start=ns;drag.clip.len=nl;}}
+  else if(drag.mode==='key'){const moved=drag.clip.moveKey(drag.lf,Math.round(xf(x)-drag.clip.start));
+    drag.lf=moved;keySel=[{clip:drag.clip,lf:moved}];if(sel&&sel.type==='key')sel.lf=moved;}
+  refresh();
+});
+window.addEventListener('mouseup',()=>{if(drag&&drag.clip)drag.clip.track.clips.sort((a,b)=>a.start-b.start);
+  if(drag&&drag.mode==='marquee')marquee=null;drag=null;refresh();});
+cv.addEventListener('contextmenu',e=>e.preventDefault()); // Ctrl+ドラッグ用
+// 空きクリップ・レーンをダブルクリック → 完全な空クリップを生成
+cv.addEventListener('dblclick',e=>{const{x,y}=mpos(e);if(y<RULER_H)return;
+  const r=rowAtY(y);if(!r||r.kind!=='track')return;const t=r.track,top=rowTopScreen(r);
+  if(t.expanded&&y>=top+ROW_C)return;                 // キーフレーム・レーンは対象外
+  const cy=top+(ROW_C-CLIP_H)/2;if(y<cy||y>cy+CLIP_H)return;
+  for(const c of t.clips){if(hiddenClips.has(c))continue;const cx=fx(c.start),cw=c.len*view.ppf;if(x>=cx&&x<=cx+cw)return;} // 既存クリップ上は無視
+  touch(t);const nc=t.addClip({name:'クリップ',start:Math.max(0,Math.round(xf(x))),len:30}); // 空クリップ許容
+  sel={type:'clip',clip:nc};marked=[];keySel=[];refresh();toast(`空クリップを ${nc.start}f に作成`);});
+// アクティブtrackへキー打ち（playhead下にクリップが無ければ自動生成）
+function punchKeys(){const ts=activeTracks();if(!ts.length){toast('アクティブなトラックがありません');return;}
+  const ph=Math.round(playhead);let n=0,nc=0;
+  ts.forEach(t=>{const pose=t.sample(ph);          // 先に現在ポーズを取得（新規空クリップの上書き前）
+    let c=t.clips.find(c=>c.contains(ph));
+    if(!c){c=t.addClip({name:'クリップ',start:ph,len:30});nc++;}
+    c.captureKey(ph-c.start,pose);n++;});
+  marked=[];sel=null;refresh();toast(`${n}トラックにキー打ち（新規${nc}）`);}
+// アクティブtrackのplayhead位置に空クリップ
+function addClipActive(){const ts=activeTracks();if(!ts.length){toast('アクティブなトラックがありません');return;}
+  const made=ts.map(t=>t.addClip({name:'クリップ',start:Math.max(0,Math.round(playhead)),len:30}));
+  marked=made.length>1?made.map(c=>({type:'clip',clip:c})):[];sel=made.length===1?{type:'clip',clip:made[0]}:null;
+  keySel=[];refresh();toast(`${made.length}トラックに空クリップ`);}
+
+// ===== PMXボーンCSV → skeleton(JSON) 生成 ＋ 既存トラックの uname(正規名)へ反映 =====
+let pmxSkeleton=null;          // 生成した skeleton（サイドカー。モーションJSONには入れない）
+let pmxHumanoidByName={};      // ボーン名 → Humanoid列挙名 の索引（uname反映用・内部のみ）
+let srcSkeleton=null;          // リターゲット元(model1)の骨格（レスト回転を持つ。データ専用・ターゲットとは別）
+let _retargetBackup=null;      // リターゲット適用前の boneトラック clips（元に戻す用）
+let motionSpace='local';       // 読み込んだモーションの空間: 'local'(生ローカル) or 'model'(レスト相対・中立)
+let autoRetarget=true;         // 読込時に自動でマッピング＋リターゲットを行う
+//  ・入力: PMXEditor 書き出しの「PmxBone」CSV（;始まりコメント行・PmxIKLink 行は skip）。
+//  ・出力: 単独の skeleton（モーションJSONには組み込まない＝サイドカー）。全ボーン収録、IK名も単純ボーンとして。
+//  ・座標: CoordinateConverter 準拠で Unity空間へ＝Z反転のみ・スケール無し（pos=[x,y,-z]、軸も各Z反転）。
+//  ・humanoid: HumanoidBoneMapping.EmbeddedMapping を JS に複製し name(→name_en) から逆引き。指は無スペース形(LeftThumbProximal)で出力。
+
+// HumanoidBoneMapping.EmbeddedMapping の複製（HumanBodyBone表示名 → 別名リスト。MMD名を含む）
+const HUMANOID_EMBED = {
+  "Hips":["Hips","hip","センター","ヒップ"], "Spine":["Spine","上半身","背骨"],
+  "Chest":["Chest","上半身2","背骨2","胸"], "UpperChest":["UpperChest","上半身3","背骨3","胸2"],
+  "Neck":["Neck","首"], "Head":["Head","頭"], "LeftEye":["LeftEye","左目"], "RightEye":["RightEye","右目"], "Jaw":["Jaw"],
+  "LeftShoulder":["LeftShoulder","左肩"], "LeftUpperArm":["LeftUpperArm","左腕"], "LeftLowerArm":["LeftLowerArm","左ひじ"], "LeftHand":["LeftHand","左手首"],
+  "RightShoulder":["RightShoulder","右肩"], "RightUpperArm":["RightUpperArm","右腕"], "RightLowerArm":["RightLowerArm","右ひじ"], "RightHand":["RightHand","右手首"],
+  "LeftUpperLeg":["LeftUpperLeg","左足"], "LeftLowerLeg":["LeftLowerLeg","左ひざ"], "LeftFoot":["LeftFoot","左足首"], "LeftToes":["LeftToes","左つま先"],
+  "RightUpperLeg":["RightUpperLeg","右足"], "RightLowerLeg":["RightLowerLeg","右ひざ"], "RightFoot":["RightFoot","右足首"], "RightToes":["RightToes","右つま先"],
+  "Left Thumb Proximal":["Left Thumb Proximal","左親指１"], "Left Thumb Intermediate":["Left Thumb Intermediate","左親指２"], "Left Thumb Distal":["Left Thumb Distal"],
+  "Left Index Proximal":["Left Index Proximal","左人指１"], "Left Index Intermediate":["Left Index Intermediate","左人指２"], "Left Index Distal":["Left Index Distal","左人指３"],
+  "Left Middle Proximal":["Left Middle Proximal","左中指１"], "Left Middle Intermediate":["Left Middle Intermediate","左中指２"], "Left Middle Distal":["Left Middle Distal","左中指３"],
+  "Left Ring Proximal":["Left Ring Proximal","左薬指１"], "Left Ring Intermediate":["Left Ring Intermediate","左薬指２"], "Left Ring Distal":["Left Ring Distal","左薬指３"],
+  "Left Little Proximal":["Left Little Proximal","左小指１"], "Left Little Intermediate":["Left Little Intermediate","左小指２"], "Left Little Distal":["Left Little Distal","左小指３"],
+  "Right Thumb Proximal":["Right Thumb Proximal","右親指１"], "Right Thumb Intermediate":["Right Thumb Intermediate","右親指２"], "Right Thumb Distal":["Right Thumb Distal"],
+  "Right Index Proximal":["Right Index Proximal","右人指１"], "Right Index Intermediate":["Right Index Intermediate","右人指２"], "Right Index Distal":["Right Index Distal","右人指３"],
+  "Right Middle Proximal":["Right Middle Proximal","右中指１"], "Right Middle Intermediate":["Right Middle Intermediate","右中指２"], "Right Middle Distal":["Right Middle Distal","右中指３"],
+  "Right Ring Proximal":["Right Ring Proximal","右薬指１"], "Right Ring Intermediate":["Right Ring Intermediate","右薬指２"], "Right Ring Distal":["Right Ring Distal","右薬指３"],
+  "Right Little Proximal":["Right Little Proximal","右小指１"], "Right Little Intermediate":["Right Little Intermediate","右小指２"], "Right Little Distal":["Right Little Distal","右小指３"]
+};
+// 逆引き: 別名 → Humanoid 列挙名（指はスペース除去）。例 "右腕"→"RightUpperArm", "左親指１"→"LeftThumbProximal"
+const ALIAS2HUMANOID = (()=>{ const m={}; for(const k in HUMANOID_EMBED){ const e=k.replace(/ /g,''); HUMANOID_EMBED[k].forEach(a=>{ if(!(a in m))m[a]=e; }); } return m; })();
+function humanoidFor(name,nameEn){ return ALIAS2HUMANOID[name] || (nameEn?ALIAS2HUMANOID[nameEn]:null) || null; }
+
+// マッピング用: Humanoid列挙名の並び（HUMANOID_EMBEDの順）。指のスペースは除去（trackのunameと同形）
+const CANON_HUMANOID = Object.keys(HUMANOID_EMBED).map(k=>k.replace(/ /g,''));
+// Humanoid列挙名 → 標準的な日本語名(MMD)。CSV未読込時のフォールバック補完用（HUMANOID_EMBEDの非ASCII別名を採用）
+const MMD_DEFAULT = (()=>{ const m={}; for(const k in HUMANOID_EMBED){ const e=k.replace(/ /g,''); const jp=HUMANOID_EMBED[k].find(a=>/[^\x00-\x7F]/.test(a)); if(jp)m[e]=jp; } return m; })();
+
+// 正規(Humanoid)階層の親マップ（bone_quat/Unity標準と一致）
+const CANON_PARENT=(()=>{ const P={Hips:null,Spine:'Hips',Chest:'Spine',UpperChest:'Chest',Neck:'UpperChest',Head:'Neck',Jaw:'Head',LeftEye:'Head',RightEye:'Head'};
+  for(const s of ['Left','Right']){
+    P[s+'Shoulder']='UpperChest'; P[s+'UpperArm']=s+'Shoulder'; P[s+'LowerArm']=s+'UpperArm'; P[s+'Hand']=s+'LowerArm';
+    P[s+'UpperLeg']='Hips'; P[s+'LowerLeg']=s+'UpperLeg'; P[s+'Foot']=s+'LowerLeg'; P[s+'Toes']=s+'Foot';
+    for(const fg of ['Thumb','Index','Middle','Ring','Little']){ P[s+fg+'Proximal']=s+'Hand'; P[s+fg+'Intermediate']=s+fg+'Proximal'; P[s+fg+'Distal']=s+fg+'Intermediate'; }
+  } return P; })();
+// クォータニオン [x,y,z,w]（world = mul(parentWorld, local)。bone_quatと同規約）
+const QR={
+  mul:(a,b)=>[a[3]*b[0]+a[0]*b[3]+a[1]*b[2]-a[2]*b[1],
+              a[3]*b[1]-a[0]*b[2]+a[1]*b[3]+a[2]*b[0],
+              a[3]*b[2]+a[0]*b[1]-a[1]*b[0]+a[2]*b[3],
+              a[3]*b[3]-a[0]*b[0]-a[1]*b[1]-a[2]*b[2]],
+  conj:q=>[-q[0],-q[1],-q[2],q[3]],
+  norm:q=>{const n=Math.hypot(q[0],q[1],q[2],q[3])||1;return [q[0]/n,q[1]/n,q[2]/n,q[3]/n];},
+  mir:q=>[q[0],-q[1],-q[2],q[3]],   // X面反射の共役（Unity→MMD左右ミラー。対合・準同型）
+  rot:(q,v)=>{const t=[2*(q[1]*v[2]-q[2]*v[1]),2*(q[2]*v[0]-q[0]*v[2]),2*(q[0]*v[1]-q[1]*v[0])];
+    return [v[0]+q[3]*t[0]+(q[1]*t[2]-q[2]*t[1]),v[1]+q[3]*t[1]+(q[2]*t[0]-q[0]*t[2]),v[2]+q[3]*t[2]+(q[0]*t[1]-q[1]*t[0])];},
+  ft:(a,b)=>{ // 単位ベクトル a→b の最短弧
+    const d=Math.max(-1,Math.min(1,a[0]*b[0]+a[1]*b[1]+a[2]*b[2]));
+    if(d>0.999999)return [0,0,0,1];
+    if(d<-0.999999){ let ax=Math.abs(a[0])<0.9?[1,0,0]:[0,1,0];
+      const c=[a[1]*ax[2]-a[2]*ax[1],a[2]*ax[0]-a[0]*ax[2],a[0]*ax[1]-a[1]*ax[0]];const n=Math.hypot(c[0],c[1],c[2])||1;
+      return [c[0]/n,c[1]/n,c[2]/n,0]; }
+    const c=[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],w=1+d,n=Math.hypot(c[0],c[1],c[2],w)||1;
+    return [c[0]/n,c[1]/n,c[2]/n,w/n]; }
+};
+// 正規ボーンの「主な子」（向き=骨→子。リターゲットのレスト方向に使用）
+const CANON_CHILD=(()=>{ const C={Hips:'Spine',Spine:'Chest',Chest:'Neck',UpperChest:'Neck',Neck:'Head'};
+  for(const s of ['Left','Right']){ C[s+'Shoulder']=s+'UpperArm'; C[s+'UpperArm']=s+'LowerArm'; C[s+'LowerArm']=s+'Hand';
+    C[s+'UpperLeg']=s+'LowerLeg'; C[s+'LowerLeg']=s+'Foot'; C[s+'Foot']=s+'Toes';
+    for(const fg of ['Thumb','Index','Middle','Ring','Little']){ C[s+fg+'Proximal']=s+fg+'Intermediate'; C[s+fg+'Intermediate']=s+fg+'Distal'; } }
+  return C; })();
+
+// 引用対応CSV分割（"..."、""エスケープ対応）
+function splitCsvLine(line){ const out=[]; let cur='',q=false;
+  for(let i=0;i<line.length;i++){ const c=line[i];
+    if(q){ if(c==='"'){ if(line[i+1]==='"'){cur+='"';i++;} else q=false; } else cur+=c; }
+    else { if(c==='"')q=true; else if(c===','){out.push(cur);cur='';} else cur+=c; } }
+  out.push(cur); return out; }
+
+// CSV → skeleton オブジェクト
+function parsePmxCsv(text){
+  const lines=text.split(/\r\n|\r|\n/), bones=[];
+  for(const raw of lines){
+    const line=raw.trim(); if(!line||line[0]===';')continue;   // 空行・コメント(;PmxBone/;PmxIKLink)を skip
+    const f=splitCsvLine(line);
+    if((f[0]||'').trim()!=='PmxBone')continue;                 // PmxIKLink 等のデータ行は skip（IKは単純ボーンとしてのみ採用）
+    const name=(f[1]||'').trim(); if(!name)continue;
+    const nameEn=(f[2]||'').trim();
+    const px=parseFloat(f[5])||0, py=parseFloat(f[6])||0, pz=parseFloat(f[7])||0;  // 列6-8: 位置
+    const parent=(f[13]||'').trim();                            // 列14: 親ボーン名
+    const bone={ name, name_en:nameEn, parent, pos:[px,py,-pz] };   // Z反転のみ・スケール無し / レスト回転は identity
+    const hum=humanoidFor(name,nameEn); if(hum)bone.humanoid=hum;
+    if((f[28]||'').trim()==='1'){                               // 列29: ローカル軸(1のときのみ)
+      const ax=[parseFloat(f[29])||0,parseFloat(f[30])||0,-(parseFloat(f[31])||0)];   // 列30-32: ローカルX軸（Z反転）
+      const az=[parseFloat(f[32])||0,parseFloat(f[33])||0,-(parseFloat(f[34])||0)];   // 列33-35: ローカルZ軸（Z反転）
+      bone.axis={x:ax,z:az};
+    }
+    bones.push(bone);
+  }
+  return { type:"skeleton", space:"unity", source:"pmx", bones };
+}
+
+// UnityBone CSV v1: UnityBone,Name,NameEn,Humanoid,Parent,PosX,PosY,PosZ （Unity座標そのまま=Z反転しない）
+function parseUnityCsv(text){
+  const lines=text.split(/\r\n|\r|\n/), bones=[];
+  for(const raw of lines){
+    const line=raw.trim(); if(!line||line[0]===';'||line[0]==='#')continue;  // メタ/コメント skip
+    const f=splitCsvLine(line);
+    if((f[0]||'').trim()!=='UnityBone')continue;
+    const name=(f[1]||'').trim(); if(!name||name==='Name')continue;          // ヘッダ行 skip
+    if(isNaN(parseFloat(f[5])))continue;                                     // PosXが数値でない＝ヘッダ行 skip
+    const nameEn=(f[2]||'').trim();
+    const hum=(f[3]||'').trim();                                             // UnityのHumanoid割当をそのまま採用
+    const parent=(f[4]||'').trim();
+    const px=parseFloat(f[5])||0, py=parseFloat(f[6])||0, pz=parseFloat(f[7])||0;
+    const bone={ name, name_en:nameEn, parent, pos:[px,py,pz] };            // 既にUnity座標（Z反転なし）
+    if(f.length>=12 && f[8]!==undefined && f[8]!==''){                       // v2: レスト・ローカル回転
+      bone.restLocal=[parseFloat(f[8])||0,parseFloat(f[9])||0,parseFloat(f[10])||0,(f[11]!==undefined&&f[11]!=='')?parseFloat(f[11]):1];
+    }
+    if(f.length>=16 && f[12]!==undefined && f[12]!==''){                     // v2: レスト・ワールド回転（ルート相対）
+      bone.restWorld=[parseFloat(f[12])||0,parseFloat(f[13])||0,parseFloat(f[14])||0,(f[15]!==undefined&&f[15]!=='')?parseFloat(f[15]):1];
+    }
+    const h = hum || humanoidFor(name,nameEn);                              // 空ならエイリアスで補完（Generic Avatar対策）
+    if(h)bone.humanoid=h;
+    bones.push(bone);
+  }
+  return { type:"skeleton", space:"unity", source:"unity", bones };
+}
+
+// 形式自動判定: UnityBone 行があれば Unity形式、なければ PMX(PmxBone)形式
+function parseBoneCsv(text){
+  const isUnity = text.split(/\r\n|\r|\n/).some(l=>{ const s=l.trim();
+    return s && s[0]!==';' && s[0]!=='#' && (splitCsvLine(s)[0]||'').trim()==='UnityBone'; });
+  return isUnity ? parseUnityCsv(text) : parsePmxCsv(text);
+}
+
+// 既存トラックの uname(正規名)へ反映：トラック名が skeleton のボーン名に一致し humanoid を持つものに設定
+function applySkeletonToTracks(){ let n=0;
+  tl.tracks.forEach(t=>{ const h=pmxHumanoidByName[t.name]; if(h && t.uname!==h){ t.uname=h; n++; } });
+  return n; }
+
+// CSV読込→skeleton構築→反映→保存有効化
+function loadPmxCsv(text,fname){
+  const skel=parseBoneCsv(text);
+  if(!skel.bones.length){ toast('ボーン行が見つかりません（PmxBone / UnityBone）'); return; }
+  pmxSkeleton=skel;
+  pmxHumanoidByName={}; skel.bones.forEach(b=>{ if(b.humanoid)pmxHumanoidByName[b.name]=b.humanoid; });
+  const mapped=Object.keys(pmxHumanoidByName).length;
+  const reflected=applySkeletonToTracks();
+  wsSend({type:'skeleton',space:skel.space,source:skel.source,bones:skel.bones,name:fname});  // 接続中なら bone_quat 等へ共有
+  document.getElementById('pmxSkelDl').disabled=false;
+  buildBoneMapFromSkeleton(false);   // 空欄を実モデルのボーン名で補完（手動編集は保持）
+  refresh();
+  toast(`${skel.source==='unity'?'Unity':'PMX'}骨格 取込: ${skel.bones.length}ボーン / Humanoid割当 ${mapped} / トラック反映 ${reflected}`);
+  maybeAutoRetarget();
+}
+
+// ===== リターゲット（model1のレストを除去し、model2のレストに乗せる）=====
+// ソース骨格(model1, レスト回転付きUnityBone CSV v2)を読み込む。ターゲット骨格(model2/PMX)とは別枠。
+function loadSrcCsv(text,fname){
+  const skel=parseBoneCsv(text);
+  if(!skel.bones.length){ toast('ボーン行が見つかりません'); return; }
+  srcSkeleton=skel;
+  const rest=buildRestIndex(skel);
+  const n=Object.keys(rest).length;
+  document.getElementById('rtgBtn').disabled=false;
+  toast(`ソース骨格(model1) 取込: ${skel.bones.length}ボーン / レスト回転あり ${n}`
+    + (n?'':'  ※RestW列が無い。UnityBone CSV v2 で出力してください'));
+  maybeAutoRetarget();
+}
+// Humanoid列挙名 → レスト・ワールド回転（root相対）の索引。RestWが無ければ空。
+function buildRestIndex(skel){ const m={};
+  if(skel)skel.bones.forEach(b=>{ if(b.humanoid && b.restWorld && !(b.humanoid in m)) m[b.humanoid]=QR.norm(b.restWorld); });
+  return m; }
+
+// 条件がそろえば自動でリターゲット（ソース骨格＝bindPose or 手動 と ターゲット骨格 が両方あるとき）
+function maybeAutoRetarget(){
+  if(!autoRetarget)return;
+  if(!srcSkeleton||!pmxSkeleton)return;
+  if(!tl.tracks.some(t=>t.type==='bone'))return;
+  try{ applyRetarget(); }catch(e){ toast('自動リターゲット失敗: '+e.message); }
+}
+// 全boneトラック(=model1モーション)を Unity→MMD（左右ミラー＋A/Tレスト吸収）でリターゲットし焼き直す
+function applyRetarget(){
+  if(!srcSkeleton){ toast('リターゲット元(model1=Unity)の「ソース骨格」CSVを読み込んでください'); return; }
+  if(!pmxSkeleton){ toast('ターゲット(model2)の「骨CSV読込」をしてください'); return; }
+  const isModel=(motionSpace==='model');
+  const srcRestW=buildRestIndex(srcSkeleton);                  // local空間用（model-spaceは不要）
+  if(!isModel && !Object.keys(srcRestW).length){ toast('local空間: ソース骨格にレスト回転(RestW)が必要（UnityBone CSV v2）'); return; }
+  // Humanoid → レスト位置。骨→主子の方向をレスト方向に
+  const posIndex=skel=>{ const m={}; if(skel)skel.bones.forEach(b=>{ if(b.humanoid&&b.pos&&!(b.humanoid in m))m[b.humanoid]=b.pos; }); return m; };
+  const sp=posIndex(srcSkeleton), tp=posIndex(pmxSkeleton);
+  const dirRest=(pos,cn)=>{ const ch=CANON_CHILD[cn]; if(!ch||!pos[cn]||!pos[ch])return null;
+    const v=[pos[ch][0]-pos[cn][0],pos[ch][1]-pos[cn][1],pos[ch][2]-pos[cn][2]],n=Math.hypot(v[0],v[1],v[2]);
+    return n>1e-9?[v[0]/n,v[1]/n,v[2]/n]:null; };
+  const Mx=v=>[-v[0],v[1],v[2]];                               // X面反射（位置/方向）
+  const boneTracks=tl.tracks.filter(t=>t.type==='bone');
+  if(!boneTracks.length){ toast('boneトラックがありません'); return; }
+  const byCanon={}; boneTracks.forEach(t=>{ byCanon[canon(t)]=t; });
+  const present=new Set(Object.keys(byCanon));
+  const parentOf=cn=>{ let p=CANON_PARENT[cn]; while(p&&!present.has(p))p=CANON_PARENT[p]; return p||null; };
+  const depthOf=cn=>{ let d=0,p=CANON_PARENT[cn]; while(p){d++;p=CANON_PARENT[p];} return d; };
+  const order=Object.keys(byCanon).sort((a,b)=>depthOf(a)-depthOf(b));
+  // 整列 A[b] = ft(Mikuレスト方向 → ミラーしたUnityレスト方向)。これが A/T差＋ミラーを吸収。子が無ければ単位。
+  const Aq={}; let aligned=0;
+  order.forEach(cn=>{ const ds=dirRest(sp,cn), dt=dirRest(tp,cn);
+    if(ds&&dt){ Aq[cn]=QR.ft(dt, Mx(ds)); aligned++; } else Aq[cn]=[0,0,0,1]; });
+  let f0=Infinity,f1=-Infinity;
+  boneTracks.forEach(t=>t.clips.forEach(c=>{ f0=Math.min(f0,c.start); f1=Math.max(f1,c.end); }));
+  if(!isFinite(f0)){ toast('リターゲットするクリップがありません'); return; }
+  f0=Math.floor(f0); f1=Math.ceil(f1); const FRAMES=f1-f0+1;
+  if(FRAMES>200000){ toast('フレーム数が多すぎます'); return; }
+  if(!_retargetBackup) _retargetBackup=boneTracks.map(t=>({id:t.id,clips:t.clips.map(c=>c.toJSON())}));
+  else _retargetBackup.forEach(bk=>{ const t=tl.tracks.find(x=>x.id===bk.id); if(t)t.clips=bk.clips.map(c=>new Clip(t,c)); });
+  const outRot={}, outPos={}; order.forEach(cn=>{ outRot[cn]=[]; outPos[cn]=[]; });
+  for(let i=0;i<FRAMES;i++){ const f=f0+i;
+    const Lsrc={}, W={}, Wt={};
+    order.forEach(cn=>{ const s=byCanon[cn].sample(f); Lsrc[cn]=s.rot||[0,0,0,1]; if(s.pos)outPos[cn].push(s.pos); });
+    order.forEach(cn=>{ const p=parentOf(cn); W[cn]= p? QR.mul(W[p],Lsrc[cn]) : Lsrc[cn].slice(); });   // FK
+    order.forEach(cn=>{
+      const E = isModel ? W[cn] : QR.mul(W[cn], QR.conj(srcRestW[cn]||[0,0,0,1]));   // ワールド差分(レスト相対)
+      Wt[cn] = QR.mul(QR.mir(E), Aq[cn]);                                            // 左右ミラー＋A/T整列
+      const p=parentOf(cn);
+      outRot[cn].push( p? QR.norm(QR.mul(QR.conj(Wt[p]),Wt[cn])) : QR.norm(Wt[cn]) );
+    });
+  }
+  order.forEach(cn=>{ const t=byCanon[cn], isRoot=parentOf(cn)===null;
+    const clip=new Clip(t,{name:'retarget',start:f0,len:FRAMES});
+    clip.keys.rot=outRot[cn].map((v,i)=>({f:i,v}));
+    if(isRoot && outPos[cn].length===FRAMES && clip.keys.pos)
+      clip.keys.pos=outPos[cn].map((v,i)=>({f:i,v:[-v[0],v[1],v[2]]}));   // Hips位置もX反転（ミラー）
+    t.clips=[clip];
+  });
+  refresh();
+  toast(`Unity→MMD リターゲット: ${order.length}トラック / 整列${aligned} / ${FRAMES}フレーム（左右ミラー＋A/T吸収）`);
+}
+function undoRetarget(){
+  if(!_retargetBackup){ toast('リターゲット前の状態がありません'); return; }
+  _retargetBackup.forEach(bk=>{ const t=tl.tracks.find(x=>x.id===bk.id); if(t)t.clips=bk.clips.map(c=>new Clip(t,c)); });
+  _retargetBackup=null; refresh(); toast('リターゲットを元に戻しました');
+}
+// Unity→MMD 左右ミラー: 各ボーンのローカル回転に X面反射の共役 (x,-y,-z,w) を適用（対合＝もう一度で戻る）
+function applyMirrorYZ(){
+  let n=0;
+  tl.tracks.filter(t=>t.type==='bone').forEach(t=>{
+    t.clips.forEach(c=>{ const a=c.keys&&c.keys.rot; if(!a)return;
+      a.forEach(k=>{ const v=k.v; if(Array.isArray(v)&&v.length===4){ k.v=[v[0],-v[1],-v[2],v[3]]; n++; } }); });
+  });
+  refresh();
+  toast(`左右ミラー(Unity→MMD): ${n}キーに適用（もう一度押すと戻る／脚は不変・腕の万歳が直る）`);
+}
+
+// ArrayBuffer → テキスト（UTF-8優先・失敗時 Shift-JIS フォールバック）。PMXEditorのCSVは Shift-JIS が多い。
+function decodeAutoText(buf){
+  const u8=new Uint8Array(buf);
+  if(u8.length>=3&&u8[0]===0xEF&&u8[1]===0xBB&&u8[2]===0xBF) return new TextDecoder('utf-8').decode(u8.subarray(3)); // UTF-8 BOM
+  try{ return new TextDecoder('utf-8',{fatal:true}).decode(u8); }       // 正当なUTF-8ならそのまま
+  catch(_){ try{ return new TextDecoder('shift-jis').decode(u8); }      // ダメなら Shift-JIS とみなす
+            catch(__){ return new TextDecoder('utf-8').decode(u8); } }  // 最後の保険（置換文字許容）
+}
+
+// ===== ボーンマッピング（Unity Humanoid 正規名 → PMXボーン名）=====
+function pmxNamesFromSkeleton(){ return pmxSkeleton?pmxSkeleton.bones.map(b=>b.name):[]; }
+// 読み込んだ骨格のhumanoid割当を逆引きして boneMap[Humanoid]=実PMX名 に。overwrite=falseなら空欄のみ補完
+function buildBoneMapFromSkeleton(overwrite){
+  if(!pmxSkeleton)return 0; const inv={};
+  pmxSkeleton.bones.forEach(b=>{ if(b.humanoid && !(b.humanoid in inv)) inv[b.humanoid]=b.name; });
+  let n=0; CANON_HUMANOID.forEach(h=>{ if(inv[h] && (overwrite || !tl.boneMap[h])){ tl.boneMap[h]=inv[h]; n++; } }); return n;
+}
+function mapEsc(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function renderMapTable(){
+  const names=pmxNamesFromSkeleton(), nameSet=new Set(names);
+  document.getElementById('pmxNameList').innerHTML=names.map(n=>`<option value="${mapEsc(n)}">`).join('');
+  const tb=document.getElementById('mapTable');
+  tb.innerHTML=CANON_HUMANOID.map(h=>{
+    const v=tl.boneMap[h]||'';
+    const cls = !v ? '' : ((!names.length||nameSet.has(v)) ? 'ok':'ng');   // ●存在 / ?未検出
+    const mark = !v ? '—' : (cls==='ok' ? '●':'?');
+    return `<div class="maprow"><span class="mapk" title="${mapEsc(h)}">${mapEsc(h)}</span>`+
+      `<input class="mapv" list="pmxNameList" data-h="${mapEsc(h)}" value="${mapEsc(v)}" placeholder="${mapEsc(MMD_DEFAULT[h]||'')}">`+
+      `<span class="mapok ${cls}">${mark}</span></div>`;
+  }).join('');
+  tb.querySelectorAll('input.mapv').forEach(inp=>{ inp.onchange=()=>{
+    const h=inp.dataset.h,val=inp.value.trim(); if(val)tl.boneMap[h]=val; else delete tl.boneMap[h];
+    renderMapTable(); sendBoneMap(); }; });
+}
+function openMapModal(){ if(!Object.keys(tl.boneMap).length) buildBoneMapFromSkeleton(false); renderMapTable(); document.getElementById('mapModal').classList.add('on'); }
+
+// ===== モーキャプ取込（中間JSON → 生のキー列 → テイク=1バンドル）=====
+// schema (sparse): { fps, space, bones:[ {name, rot:[{f,v:[x,y,z,w]|[ex,ey,ez]}], pos:[{f,v:[x,y,z]}]} ], morphs:[ {name, w:[{f,v}]} ] }
+function importMocap(data,name){
+  if(data&&data.space)motionSpace=data.space;                        // モーション空間を保持（model-spaceなら二重補正を防ぐ）
+  _retargetBackup=null;                                              // 新しいモーション＝リターゲットの基準をリセット
+  if(data&&data.bindPose&&Array.isArray(data.bindPose.bones)){       // バインドポーズ同梱なら自動でソース骨格に
+    srcSkeleton={type:'skeleton',space:(data.bindPose.space||'unity'),source:'bind',
+      bones:data.bindPose.bones.map(b=>({name:b.name,humanoid:b.name,pos:b.pos,restWorld:b.rot}))};
+  }
+  document.getElementById('rtgBtn').disabled=false;                  // モーションが入ればリターゲット可能に
+  const bonesArr=Array.isArray(data&&data.bones)?data.bones:null;
+  const morphsArr=Array.isArray(data&&data.morphs)?data.morphs:[];
+  if(!bonesArr&&!morphsArr.length){toast('bones が見つかりません');return;}
+  const fps=(data&&data.fps)||tl.fps,start=Math.max(0,Math.round(playhead));
+  // 全キーの最大フレーム番号からクリップ長を決める
+  let maxF=0; const scan=arr=>{(arr||[]).forEach(k=>{if(k&&(k.f|0)>maxF)maxF=k.f|0;});};
+  (bonesArr||[]).forEach(tr=>{scan(tr.rot);scan(tr.pos);});
+  morphsArr.forEach(tr=>scan(tr.w));
+  const F=maxF+1;
+  const ensure=(nm,type)=>tl.tracks.find(t=>t.type===type&&t.name===nm)||tl.addTrack({name:nm,type,color:pickCol()});
+  const push=(clip,ch,lf,v)=>{const a=clip.keys[ch];if(a)a.push({f:lf,v:Array.isArray(v)?v.slice():v});};
+  const clipIds=[];
+  (bonesArr||[]).forEach(tr=>{if(!tr||!tr.name)return;
+    const t=ensure(tr.name,'bone'),c=t.addClip({name,start,len:F});
+    if(!t.uname){const h=pmxHumanoidByName[tr.name];if(h)t.uname=h;}   // 骨格読込済みなら正規名を反映
+    (tr.rot||[]).forEach(k=>{const v=k&&k.v;if(!v)return;
+      push(c,'rot',k.f|0,v.length===4?Q.norm(v):Q.fromEuler(v[0],v[1],v[2]));});
+    (tr.pos||[]).forEach(k=>{const v=k&&k.v;if(!v)return;
+      push(c,'pos',k.f|0,[+v[0],+v[1],+v[2]]);});
+    c._sort();clipIds.push(c.id);});
+  morphsArr.forEach(tr=>{if(!tr||!tr.name)return;
+    const t=ensure(tr.name,'morph'),c=t.addClip({name,start,len:F});
+    (tr.w||[]).forEach(k=>{if(k==null||k.v==null)return;push(c,'w',k.f|0,+k.v);});
+    c._sort();clipIds.push(c.id);});
+  if(!clipIds.length){toast('ボーン/モーフが見つかりません');return;}
+  const b=tl.addBundle({name,color:'#a78bfa',clipIds}); // テイク=1バンドル
+  sel={type:'bundle',bundle:b};marked=[];keySel=[];refresh();
+  toast(`取込: ${F}f / ${clipIds.length}トラック（${fps}fps, ${start}f〜）`);
+  if(fps!==tl.fps)toast(`注: テイク${fps}fps≠プロジェクト${tl.fps}fps（1フレーム=1キーで取込）`);
+  maybeAutoRetarget();}
+function hover(e){const{x,y}=mpos(e);let cur='default';
+  if(bundleHit(x,y)){cv.style.cursor='grab';return;}
+  const r=rowAtY(y);
+  if(y<RULER_H)cur='ew-resize';
+  else if(r&&r.kind==='track'){const t=r.track,top=rowTopScreen(r);
+    if(t.expanded&&y>=top+ROW_C){for(const c of t.clips)for(const lf of c.keyFrames())if(Math.abs(fx(c.start+lf)-x)<6)cur='pointer';}
+    else{const cy=top+(ROW_C-CLIP_H)/2;for(const c of t.clips){if(hiddenClips.has(c))continue;const cx=fx(c.start),cw=c.len*view.ppf;
+      if(y<cy||y>cy+CLIP_H)continue;if(Math.abs(x-cx)<6||Math.abs(x-(cx+cw))<6)cur='ew-resize';else if(x>=cx&&x<=cx+cw)cur='grab';}}}
+  cv.style.cursor=cur;}
+function mpos(e){const r=cv.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top};}
+
+cvArea.addEventListener('wheel',e=>{e.preventDefault();
+  if(e.ctrlKey||e.metaKey){zoomTo(view.ppf*Math.exp(-e.deltaY*0.0015));}   // プレイヘッド中心ズーム
+  else if(e.shiftKey){view.start=Math.max(0,view.start+(e.deltaY+e.deltaX)/view.ppf);}
+  else{scrollY=M.clamp(scrollY+e.deltaY,0,maxScroll());view.start=Math.max(0,view.start+e.deltaX/view.ppf);}
+  refresh();
+},{passive:false});
+
+/* ---- ズーム（プレイヘッドを中心に）／スクロールバー ---- */
+function zoomTo(np){np=M.clamp(np,0.6,60);const sx=fx(playhead);view.ppf=np;view.start=Math.max(0,playhead-sx/np);}
+function hRange(){return Math.max(tl.length, view.start+W/view.ppf, W/view.ppf, 1);}
+function updateScrollbars(){
+  const barW=hscroll.clientWidth, vis=W/view.ppf, range=hRange(), maxStart=Math.max(0,range-vis);
+  const tw=M.clamp(vis/range*barW,24,barW);
+  const tx=maxStart>0?(M.clamp(view.start,0,maxStart)/maxStart)*(barW-tw):0;
+  hthumb.style.width=tw+'px';hthumb.style.left=tx+'px';
+  const vh=H-RULER_H, ms=maxScroll(), barH=vscroll.clientHeight;
+  if(ms<=0){vscroll.style.display='none';}
+  else{vscroll.style.display='';const th=M.clamp(vh/contentH*barH,24,barH);
+    vthumb.style.height=th+'px';vthumb.style.top=((scrollY/ms)*(barH-th))+'px';}
+}
+hthumb.addEventListener('mousedown',e=>{e.preventDefault();e.stopPropagation();
+  const barW=hscroll.clientWidth,range=hRange(),sx=e.clientX,sv=view.start;
+  const mm=ev=>{view.start=Math.max(0,sv+((ev.clientX-sx)/barW)*range);refresh();};
+  const mu=()=>{document.removeEventListener('mousemove',mm);document.removeEventListener('mouseup',mu);};
+  document.addEventListener('mousemove',mm);document.addEventListener('mouseup',mu);});
+hscroll.addEventListener('mousedown',e=>{if(e.target===hthumb)return;
+  const r=hscroll.getBoundingClientRect(),barW=hscroll.clientWidth,range=hRange(),vis=W/view.ppf;
+  view.start=M.clamp(((e.clientX-r.left)/barW)*range-vis/2,0,Math.max(0,range-vis));refresh();});
+vthumb.addEventListener('mousedown',e=>{e.preventDefault();e.stopPropagation();
+  const barH=vscroll.clientHeight,th=vthumb.offsetHeight,ms=maxScroll(),sy=e.clientY,sc=scrollY;
+  const mm=ev=>{scrollY=M.clamp(sc+((ev.clientY-sy)/Math.max(1,barH-th))*ms,0,ms);refresh();};
+  const mu=()=>{document.removeEventListener('mousemove',mm);document.removeEventListener('mouseup',mu);};
+  document.addEventListener('mousemove',mm);document.addEventListener('mouseup',mu);});
+vscroll.addEventListener('mousedown',e=>{if(e.target===vthumb)return;
+  const r=vscroll.getBoundingClientRect(),barH=vscroll.clientHeight,ms=maxScroll(),vh=H-RULER_H;
+  scrollY=M.clamp(((e.clientY-r.top)/barH)*contentH-vh/2,0,ms);refresh();});
+
+/* ============================================================================ 6. インスペクタ / 出力 / 再生 */
+function renderInsp(){const el=document.getElementById('insp'),tag=document.getElementById('inspTag');
+  if(marked.length&&!sel){tag.textContent='SELECT '+marked.length;
+    el.innerHTML=`<div class="hint">${marked.length}個を選択中（縦に束ねられます）。</div>
+      <div class="ibtns"><button id="m_bundle">バンドル化</button><button id="m_clear">選択解除</button></div>`;
+    i('m_bundle','click',doBundle);i('m_clear','click',()=>{marked=[];refresh();});return;}
+  if(!sel){tag.textContent='';el.innerHTML='<div class="hint">クリップ（棒）を選ぶとパッケージを編集できます。トラック左の ▸ で展開するとドープシートが開きキーフレームを編集できます。<br><br>Shift+クリックで複数のクリップ／バンドルを選び「バンドル化」で縦にまとめられます（入れ子も可）。バンドルは上部タブを掴んで一括移動。<br><br><b>アクティブtrack</b>: ヘッダの ◉ で指定（複数可。未指定なら最後に触ったトラック）。<b>K</b>＝アクティブtrackにキー打ち（クリップ無ければ自動生成）、<b>C</b>＝空クリップ、空きレーンの<b>ダブルクリック</b>でも空クリップを作成。<br><br>トラック名／グループ名はクリックで変更。</div>';return;}
+  if(sel.type==='bundle'){const b=sel.bundle,bd=bBounds(b)||{start:0,end:0};tag.textContent='BUNDLE';
+    el.innerHTML=`
+      <div class="row"><label>名前</label><input type="text" id="b_nm" value="${esc(b.name)}"></div>
+      <div class="row"><label>開始 f</label><input type="number" id="b_st" value="${bd.start}"></div>
+      <div class="hint">範囲 ${bd.start} – ${bd.end} f / クリップ ${bAllClips(b).length} ・ 子バンドル ${b.childIds.length}</div>
+      <div class="ibtns">
+        <button id="b_col">${b.collapsed?'展開':'折りたたみ'}</button>
+        <button id="b_cp">コピー</button><button id="b_ps">ペースト</button></div>
+      <div class="ibtns">
+        <button id="b_ung">解除（中身は残す）</button><button id="b_del">中身ごと削除</button></div>`;
+    i('b_nm','input',v=>{b.name=v.target.value;draw();});
+    i('b_st','change',v=>{bSetStart(b,+v.target.value|0);refresh();});
+    i('b_col','click',()=>{b.collapsed=!b.collapsed;refresh();});
+    i('b_cp','click',()=>copyBundle(b));
+    i('b_ps','click',pasteAny);
+    i('b_ung','click',()=>{bUngroup(b);sel=null;refresh();toast('バンドルを解除しました');});
+    i('b_del','click',()=>{if(confirm(`「${b.name}」を中身のクリップごと削除しますか？`)){bDeleteWithClips(b);sel=null;refresh();}});
+    return;}
+  if(sel.type==='keyset'){tag.textContent='KEYS '+keySel.length;
+    const ntr=new Set(keySel.map(k=>{const t=tl.trackOfClip(k.clip);return t&&t.id;})).size;
+    el.innerHTML=`<div class="hint">${keySel.length}キーを選択中（${ntr}トラック）。<br>矩形ドラッグで <b>Shift＝追加</b> / <b>Ctrl(Cmd)＝除外</b>。<br>コピー後、<b>⚙ペースト設定</b>で方式（新規/マージ）・配置（playhead/絶対）・<b>軸反転</b>・<b>貼り付け先トラック</b>を指定して貼り付けます。</div>
+      <div class="ibtns"><button id="ks_cp">コピー</button><button id="ks_ps">ペースト</button><button id="ks_del">選択キー削除</button></div>`;
+    i('ks_cp','click',copyKeys);i('ks_ps','click',pasteAny);
+    i('ks_del','click',()=>{keySel.forEach(k=>k.clip.removeKeyAt(k.lf));keySel=[];sel=null;refresh();});
+    return;}
+  if(sel.type==='clip'){const c=sel.clip;tag.textContent='CLIP';
+    el.innerHTML=`
+      <div class="row"><label>名前</label><input type="text" id="i_nm" value="${esc(c.name)}"></div>
+      <div class="row"><label>開始 f</label><input type="number" id="i_st" value="${c.start}"></div>
+      <div class="row"><label>長さ f</label><input type="number" id="i_ln" value="${c.len}" min="1"></div>
+      <div class="row"><label>ループ</label><input type="checkbox" id="i_lp" ${c.loop?'checked':''}>
+        <span class="hint" style="flex:1">長さで折返し再生</span></div>
+      <div class="row"><label>強さ w</label><input type="range" id="i_wt" min="0" max="1" step="0.01" value="${c.weight}">
+        <span class="v" id="i_wv">${c.weight.toFixed(2)}</span></div>
+      <div class="hint" style="margin-top:6px">キー: ${c.keyFrames().length} 個 / ${c.track.channels.map(x=>x.label).join(' · ')}</div>
+      <div class="ibtns">
+        <button id="b_key">キー追加</button><button id="b_copy">コピー</button>
+        <button id="b_paste">ペースト</button><button id="b_del">削除</button></div>`;
+    i('i_nm','input',v=>{c.name=v.target.value;renderHeads();draw();});
+    i('i_st','change',v=>{c.start=Math.max(0,+v.target.value|0);c.track.clips.sort((a,b)=>a.start-b.start);refresh();});
+    i('i_ln','change',v=>{c.len=Math.max(1,+v.target.value|0);refresh();});
+    i('i_lp','change',v=>{c.loop=v.target.checked;refresh();});
+    i('i_wt','input',v=>{c.weight=+v.target.value;document.getElementById('i_wv').textContent=c.weight.toFixed(2);draw();renderPose();});
+    i('b_key','click',()=>{const lf=Math.round(playhead-c.start);if(lf<0||lf>=c.len){toast('playheadがクリップ範囲外です');return;}
+      c.captureKey(lf,c.track.sample(playhead));sel={type:'key',clip:c,lf:Math.round(M.clamp(lf,0,c.len-1))};refresh();});
+    i('b_copy','click',()=>copyClip(c));
+    i('b_paste','click',pasteAny);
+    i('b_del','click',()=>{c.track.removeClip(c);sel=null;refresh();});
+  }else{const c=sel.clip,lf=sel.lf;tag.textContent='KEY @'+lf;
+    let html=`<div class="row"><label>ローカルf</label><input type="number" id="k_f" value="${lf}" min="0" max="${c.len-1}"></div>
+      <div class="hint">グローバル ${c.start+lf} f</div>`;
+    c.track.channels.forEach(ch=>{const kf=c.keys[ch.name].find(k=>k.f===lf);if(!kf)return;
+      html+=`<div class="chan"><div class="cl">${ch.label}</div>`;
+      if(ch.kind==='quat'){const e=Q.toEuler(kf.v).map(n=>n.toFixed(1));
+        html+=`<div class="triplet"><input data-ch="${ch.name}" data-e="0" value="${e[0]}"><input data-ch="${ch.name}" data-e="1" value="${e[1]}"><input data-ch="${ch.name}" data-e="2" value="${e[2]}"></div><div class="hint" style="margin-top:2px">X Y Z 度</div>`;
+      }else if(ch.kind==='vec3'){const v=kf.v.map(n=>(+n).toFixed(2));
+        html+=`<div class="triplet"><input data-ch="${ch.name}" data-i="0" value="${v[0]}"><input data-ch="${ch.name}" data-i="1" value="${v[1]}"><input data-ch="${ch.name}" data-i="2" value="${v[2]}"></div>`;
+      }else{html+=`<div class="row"><input type="range" data-ch="${ch.name}" data-s="1" min="0" max="1" step="0.01" value="${kf.v}" style="flex:1"><span class="v">${(+kf.v).toFixed(2)}</span></div>`;}
+      html+='</div>';});
+    html+=`<div class="ibtns"><button id="k_cp">コピー</button><button id="k_del">このキーを削除</button></div>`;el.innerHTML=html;
+    i('k_cp','click',copyKeys);
+    i('k_f','change',v=>{sel.lf=c.moveKey(lf,+v.target.value|0);refresh();});
+    el.querySelectorAll('[data-ch]').forEach(inp=>inp.addEventListener('input',()=>{
+      const ch=inp.dataset.ch,kf=c.keys[ch].find(k=>k.f===lf);
+      if(inp.dataset.e!==undefined){const ins=el.querySelectorAll(`[data-ch="${ch}"][data-e]`);
+        kf.v=Q.fromEuler(...[...ins].map(x=>+x.value||0));}
+      else if(inp.dataset.i!==undefined){const ins=el.querySelectorAll(`[data-ch="${ch}"][data-i]`);
+        kf.v=[...ins].map(x=>+x.value||0);}
+      else{kf.v=+inp.value;inp.nextElementSibling.textContent=(+inp.value).toFixed(2);}
+      const tt=tl.trackOfClip(c);notifyEdit(tt&&tt.id,c.start+lf,ch);
+      draw();renderPose();}));
+    i('k_del','click',()=>{c.removeKeyAt(lf);sel=null;refresh();});
+  }}
+function i(id,ev,fn){const e=document.getElementById(id);if(e)e.addEventListener(ev,fn);}
+
+/* ---- コピー & ペースト ---- */
+let clipboard=null; // {kind:'clip'|'bundle', ...}
+function copyClip(c){clipboard={kind:'clip',type:c.track.type,srcId:tl.trackOfClip(c).id,data:{...c.toJSON(),id:undefined}};
+  toast(`「${c.name}」をコピー`);updatePasteBtn();}
+function pasteClip(){if(!clipboard||clipboard.kind!=='clip'){toast('クリップが未コピーです');return;}
+  let target=(sel&&sel.type==='clip')?tl.trackOfClip(sel.clip):null;
+  if(!target||target.type!==clipboard.type)target=tl.tracks.find(t=>t.id===clipboard.srcId);
+  if(!target||target.type!==clipboard.type)target=tl.tracks.find(t=>t.type===clipboard.type);
+  if(!target){toast('貼り付け先トラックがありません');return;}
+  const nc=target.addClip({...clipboard.data,id:undefined,start:Math.round(playhead)});
+  sel={type:'clip',clip:nc};refresh();toast(`「${nc.name}」を ${nc.start}f に貼付（${target.name}）`);}
+function copyBundle(b){clipboard={kind:'bundle',id:b.id,start:(bBounds(b)||{start:0}).start};
+  toast(`バンドル「${b.name}」をコピー`);updatePasteBtn();}
+function copyKeys(){if(!keySel.length){toast('キーが選択されていません');return;}
+  const anchor=Math.min(...keySel.map(k=>k.clip.start+k.lf)),groups={};
+  keySel.forEach(k=>{const t=tl.trackOfClip(k.clip);if(!t)return;const gf=k.clip.start+k.lf,values={};
+    t.channels.forEach(ch=>{const e=k.clip.keys[ch.name].find(e=>e.f===k.lf);
+      if(e)values[ch.name]=Array.isArray(e.v)?e.v.slice():e.v;});
+    (groups[t.id]=groups[t.id]||{trackId:t.id,name:k.clip.name,keys:[]}).keys.push({gf,values});});
+  clipboard={kind:'keys',anchor,perTrack:Object.values(groups)};
+  pasteOpt.map={};clipboard.perTrack.forEach(g=>pasteOpt.map[g.trackId]=g.trackId); // 既定=同トラック
+  updatePasteBtn();
+  toast(`${keySel.length}キー（${Object.keys(groups).length}トラック）をコピー`);}
+// ペースト設定（方式／配置／軸反転ミラー／貼り付け先トラック対応）
+let pasteOpt={mode:'new',place:'playhead',flip:'none',map:{}};
+const AX={x:0,y:1,z:2};
+function flipVal(kind,v,axis){if(axis==='none')return v;const a=AX[axis];
+  if(kind==='quat'){const q=v.slice();for(let i=0;i<3;i++)if(i!==a)q[i]=-q[i];return q;} // 鏡像: 軸成分とwは保持、他2成分を反転
+  if(kind==='vec3'){const p=v.slice();p[a]=-p[a];return p;}                                // 位置: 軸成分を反転
+  return v;}
+function flipValues(t,values){const fv={};
+  Object.entries(values).forEach(([ch,val])=>{const def=t.channels.find(c=>c.name===ch);
+    fv[ch]=def?flipVal(def.kind,val,pasteOpt.flip):val;});return fv;}
+function newClipForGroup(g,t){ // 新規クリップを作って貼り付け
+  let clipStart,localOf;
+  if(pasteOpt.place==='absolute'){const gmin=Math.min(...g.keys.map(k=>k.gf));clipStart=gmin;localOf=k=>k.gf-gmin;}
+  else{clipStart=Math.round(playhead);localOf=k=>k.gf-clipboard.anchor;}
+  const maxLocal=Math.max(...g.keys.map(localOf));
+  const nc=t.addClip({name:g.name||'貼付',start:clipStart,len:Math.max(1,maxLocal+1)});
+  g.keys.forEach(k=>nc.captureKey(localOf(k),flipValues(t,k.values)));return nc;}
+function mergeTargetClip(t){const ph=Math.round(playhead); // playhead下、無ければ末尾クリップ
+  return t.clips.find(c=>c.contains(ph))||(t.clips.length?t.clips[t.clips.length-1]:null);}
+function mergeIntoClip(g,t,mc){ // 既存クリップmcへキーを差し込み（必要なら伸長。グローバル位置は保持）
+  const locOf=pasteOpt.place==='absolute'?(k=>k.gf-mc.start):(k=>(Math.round(playhead)-mc.start)+(k.gf-clipboard.anchor));
+  let locs=g.keys.map(locOf);const minL=Math.min(...locs);
+  if(minL<0){const d=-minL;mc.start-=d;for(const ch in mc.keys)mc.keys[ch].forEach(e=>e.f+=d);locs=locs.map(l=>l+d);} // 左方向へ伸長（既存キーはグローバル位置維持）
+  let maxF=Math.max(...locs);for(const ch in mc.keys)mc.keys[ch].forEach(e=>{if(e.f>maxF)maxF=e.f;});
+  mc.len=Math.max(mc.len,maxF+1); // captureのクランプ前に長さ確定
+  g.keys.forEach((k,idx)=>mc.captureKey(locs[idx],flipValues(t,k.values)));return mc;}
+function pasteKeys(){const out=[];
+  clipboard.perTrack.forEach(g=>{const tid=(pasteOpt.map&&pasteOpt.map[g.trackId])||g.trackId;
+    const t=tl.tracks.find(x=>x.id===tid);if(!t)return;
+    if(pasteOpt.mode==='merge'){const mc=mergeTargetClip(t);
+      out.push(mc?mergeIntoClip(g,t,mc):newClipForGroup(g,t));} // マージ先が無ければ新規にフォールバック
+    else out.push(newClipForGroup(g,t));});
+  if(!out.length){toast('貼り付け先がありません');return;}
+  new Set(out.map(c=>tl.trackOfClip(c))).forEach(t=>t&&t.clips.sort((a,b)=>a.start-b.start));
+  keySel=[];const uniq=[...new Set(out)];
+  marked=uniq.length>1?uniq.map(c=>({type:'clip',clip:c})):[];
+  sel=uniq.length===1?{type:'clip',clip:uniq[0]}:null;refresh();
+  const tag=(pasteOpt.mode==='merge'?'マージ':'新規')+'/'+(pasteOpt.place==='absolute'?'絶対':'playhead')+(pasteOpt.flip!=='none'?' 反転'+pasteOpt.flip.toUpperCase():'');
+  toast(`${out.length}件 ${tag}`);}
+function autoMapLR(){if(!clipboard||clipboard.kind!=='keys')return;
+  clipboard.perTrack.forEach(g=>{const src=tl.tracks.find(t=>t.id===g.trackId);if(!src)return;
+    const sw=src.name.replace(/右/g,'◆').replace(/左/g,'右').replace(/◆/g,'左');
+    const tgt=tl.tracks.find(t=>t.type===src.type&&t.name===sw);if(tgt)pasteOpt.map[g.trackId]=tgt.id;});}
+function pasteAny(){if(!clipboard){toast('クリップボードが空です');return;}
+  if(clipboard.kind==='clip'){pasteClip();return;}
+  if(clipboard.kind==='keys'){pasteKeys();return;}
+  const src=tl.getBundle(clipboard.id);if(!src){toast('元バンドルが見つかりません');return;}
+  const nb=bClone(src,Math.round(playhead)-clipboard.start);
+  nb.name=src.name+'_copy';sel={type:'bundle',bundle:nb};marked=[];refresh();toast(`バンドル「${nb.name}」を貼付`);}
+function updatePasteBtn(){document.getElementById('pasteBtn').disabled=!clipboard;}
+function doBundle(){if(marked.length<2){toast('2つ以上を選んでください');return;}
+  const name=prompt('バンドル名','バンドル');if(name===null)return;
+  const b=bMakeFrom(marked,name||'バンドル');marked=[];sel={type:'bundle',bundle:b};refresh();toast(`「${b.name}」に束ねました`);}
+
+function renderPose(){const pose=tl.sample(playhead),rows=[];
+  tl.tracks.forEach(t=>{const s=pose[t.id];
+    t.channels.forEach((ch,j)=>{let str;const v=s[ch.name];
+      if(ch.kind==='quat')str=Q.toEuler(v).map(n=>n.toFixed(1).padStart(6)).join(' ');
+      else if(ch.kind==='vec3'||ch.kind==='scale3')str=v.map(n=>n.toFixed(2).padStart(6)).join(' ');
+      else str=(v*100).toFixed(0).padStart(3)+'%';
+      const active=t.clips.some(c=>c.contains(playhead));
+      rows.push(`<tr><td class="k">${j===0?`<span class="dot" style="background:${t.color}"></span>`+esc(t.name):''}<span style="color:var(--dim2)">${ch.name}</span></td><td class="v" style="opacity:${active?1:.4}">${str}</td></tr>`);});});
+  document.getElementById('pose').innerHTML=`<table>${rows.join('')}</table>`;}
+
+let last=0;
+function loop(ts){if(!playing)return;if(!last)last=ts;const dt=(ts-last)/1000;last=ts;
+  playhead+=dt*tl.fps;const L=tl.length;if(playhead>=L)playhead-=L;if(playhead<0)playhead=0;
+  if(fx(playhead)>W*0.85)view.start=playhead-W*0.55/view.ppf;
+  if(fx(playhead)<W*0.05)view.start=Math.max(0,playhead-W*0.4/view.ppf);
+  syncPlay();notifyFrame();draw();renderPose();requestAnimationFrame(loop);}
+function setPlayhead(f){playhead=Math.max(0,f);syncPlay();notifyFrame();}
+function syncPlay(){document.getElementById('curF').textContent=Math.round(playhead);}
+
+/* ============================================================================ 7. ツールバー / 更新 */
+function pruneBundles(){tl.bundles=tl.bundles.filter(b=>bAllClips(b).length>0||b.childIds.length>0);}
+function refresh(){normalizeOrder();pruneBundles();layoutRows();scrollY=M.clamp(scrollY,0,maxScroll());
+  renderHeads();draw();renderInsp();renderPose();updatePasteBtn();
+  document.getElementById('totF').textContent=tl.length;document.getElementById('fpsR').textContent=tl.fps;syncPlay();
+  emitState();}
+
+document.getElementById('play').onclick=function(){playing=!playing;this.textContent=playing?'⏸':'▶';
+  this.classList.toggle('pri',!playing);if(playing){last=0;requestAnimationFrame(loop);}};
+document.getElementById('toStart').onclick=()=>{setPlayhead(0);view.start=0;draw();renderPose();};
+document.getElementById('zIn').onclick=()=>{zoomTo(view.ppf*1.3);refresh();};
+document.getElementById('zOut').onclick=()=>{zoomTo(view.ppf/1.3);refresh();};
+document.getElementById('zFit').onclick=()=>{view.start=0;view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refresh();};
+const PAL=['#38bdf8','#2dd4bf','#a78bfa','#f472b6','#fb7185','#fbbf24','#4ade80','#22d3ee'];
+function pickCol(){return PAL[tl.tracks.length%PAL.length];}
+document.getElementById('addBone').onclick=()=>{const t=tl.addTrack({name:'ボーン'+(tl.tracks.length+1),type:'bone',color:pickCol()});
+  t.addClip({name:'パッケージ',start:Math.round(playhead),len:60}).captureKey(0,{rot:Q.ID,pos:[0,0,0]});refresh();};
+document.getElementById('addMorph').onclick=()=>{const t=tl.addTrack({name:'表情'+(tl.tracks.length+1),type:'morph',color:pickCol()});
+  const c=t.addClip({name:'モーフ',start:Math.round(playhead),len:30});c.captureKey(0,{w:0});c.captureKey(15,{w:1});c.captureKey(29,{w:0});refresh();};
+document.getElementById('expAll').onclick=()=>{const any=tl.tracks.some(t=>!t.expanded);tl.tracks.forEach(t=>t.expanded=any);refresh();};
+document.getElementById('addClipBtn').onclick=addClipActive;
+document.getElementById('punchBtn').onclick=punchKeys;
+document.getElementById('copyBtn').onclick=()=>{if(sel&&sel.type==='clip')copyClip(sel.clip);
+  else if(sel&&sel.type==='bundle')copyBundle(sel.bundle);
+  else if(keySel.length)copyKeys();else toast('クリップ／バンドル／キーを選択してください');};
+document.getElementById('pasteBtn').onclick=pasteAny;
+document.getElementById('bundleBtn').onclick=doBundle;
+document.getElementById('pasteCfg').onclick=e=>{const r=e.target.getBoundingClientRect();pasteSettings(r.left,r.bottom+4);};
+function pasteSettings(px,py){closePopup();
+  const m=document.createElement('div');m.className='popup setpop';
+  let html=`<div class="ph">ペースト設定</div>
+    <div class="pr"><span>方式</span>
+      <label><input type="radio" name="md" value="new" ${pasteOpt.mode==='new'?'checked':''}> 新規クリップ</label>
+      <label><input type="radio" name="md" value="merge" ${pasteOpt.mode==='merge'?'checked':''}> 既存へマージ</label></div>
+    <div class="pr"><span>配置</span>
+      <label><input type="radio" name="pl" value="playhead" ${pasteOpt.place==='playhead'?'checked':''}> playhead基準</label>
+      <label><input type="radio" name="pl" value="absolute" ${pasteOpt.place==='absolute'?'checked':''}> 絶対フレーム保持</label></div>
+    <div class="pr"><span>軸反転(ミラー)</span>
+      ${['none','x','y','z'].map(a=>`<label><input type="radio" name="fl" value="${a}" ${pasteOpt.flip===a?'checked':''}> ${a==='none'?'なし':a.toUpperCase()}</label>`).join('')}</div>`;
+  if(pasteOpt.mode==='merge')html+=`<div class="hint" style="padding:2px 8px 4px">マージ先＝各トラックの<b>playhead下のクリップ</b>（無ければ末尾）。範囲外のキーはクリップを伸長します。</div>`;
+  if(clipboard&&clipboard.kind==='keys'){
+    html+=`<div class="ph2"><span>貼り付け先トラック</span><button id="autoLR" class="mini">右↔左 自動</button></div>`;
+    clipboard.perTrack.forEach(g=>{const src=tl.tracks.find(t=>t.id===g.trackId);
+      const opts=tl.tracks.filter(t=>!src||t.type===src.type)
+        .map(t=>`<option value="${t.id}" ${(pasteOpt.map[g.trackId]||g.trackId)===t.id?'selected':''}>${esc(t.name)}</option>`).join('');
+      html+=`<div class="pr"><span>${esc(src?src.name:g.name)} →</span><select data-src="${g.trackId}">${opts}</select></div>`;});
+  }else{html+=`<div class="hint" style="padding:6px 8px">キーをコピーすると貼り付け先トラックを個別指定できます。</div>`;}
+  m.innerHTML=html;document.body.appendChild(m);
+  const r=m.getBoundingClientRect();
+  m.style.left=Math.min(px,innerWidth-r.width-8)+'px';m.style.top=Math.min(py,innerHeight-r.height-8)+'px';
+  m.querySelectorAll('input[name=md]').forEach(el=>el.onchange=()=>{if(el.checked){pasteOpt.mode=el.value;pasteSettings(px,py);}});
+  m.querySelectorAll('input[name=pl]').forEach(el=>el.onchange=()=>{if(el.checked)pasteOpt.place=el.value;});
+  m.querySelectorAll('input[name=fl]').forEach(el=>el.onchange=()=>{if(el.checked)pasteOpt.flip=el.value;});
+  m.querySelectorAll('select[data-src]').forEach(s=>s.onchange=()=>pasteOpt.map[s.dataset.src]=s.value);
+  const auto=m.querySelector('#autoLR');if(auto)auto.onclick=()=>{autoMapLR();pasteSettings(px,py);};
+  setTimeout(()=>document.addEventListener('mousedown',function h(ev){if(!m.contains(ev.target)){m.remove();document.removeEventListener('mousedown',h);}}),0);}
+
+document.getElementById('mocapBtn').onclick=()=>document.getElementById('mocapFile').click();
+document.getElementById('mocapFile').onchange=function(){const f=this.files&&this.files[0];if(!f)return;
+  const rd=new FileReader();rd.onload=()=>{try{importMocap(JSON.parse(rd.result),f.name.replace(/\.[^.]+$/,''));}
+    catch(e){alert('JSON解析エラー: '+e.message);}};rd.readAsText(f);this.value='';};
+
+document.getElementById('pmxCsvBtn').onclick=()=>document.getElementById('pmxCsvFile').click();
+document.getElementById('pmxCsvFile').onchange=function(){const f=this.files&&this.files[0];if(!f)return;
+  const rd=new FileReader();rd.onload=()=>{try{loadPmxCsv(decodeAutoText(rd.result),f.name.replace(/\.[^.]+$/,''));}
+    catch(e){alert('CSV読込エラー: '+e.message);}};rd.readAsArrayBuffer(f);this.value='';};
+document.getElementById('pmxSkelDl').onclick=()=>{ if(!pmxSkeleton){toast('先にPMX骨CSVを読み込んでください');return;}
+  const blob=new Blob([JSON.stringify(pmxSkeleton,null,1)],{type:'application/json'});  // 内部索引は含めず skeleton 本体のみ保存
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='skeleton.json';a.click();};
+
+document.getElementById('mapBtn').onclick=openMapModal;
+document.getElementById('srcCsvBtn').onclick=()=>document.getElementById('srcCsvFile').click();
+document.getElementById('srcCsvFile').onchange=function(){const f=this.files&&this.files[0];if(!f)return;
+  const rd=new FileReader();rd.onload=()=>{try{loadSrcCsv(decodeAutoText(rd.result),f.name.replace(/\.[^.]+$/,''));}
+    catch(e){alert('CSV読込エラー: '+e.message);}};rd.readAsArrayBuffer(f);this.value='';};
+document.getElementById('rtgBtn').onclick=applyRetarget;
+document.getElementById('rtgUndo').onclick=undoRetarget;
+document.getElementById('mirrorBtn').onclick=applyMirrorYZ;
+document.getElementById('advToggle').onclick=()=>{ const a=document.getElementById('advTools');
+  const on=a.style.display==='none'; a.style.display=on?'inline':'none';
+  document.getElementById('advToggle').classList.toggle('pri',on); };
+document.getElementById('mapAuto').onclick=()=>{ if(!pmxSkeleton){toast('先にPMX骨CSVを読み込んでください');return;}
+  const n=buildBoneMapFromSkeleton(true);renderMapTable();sendBoneMap();toast(`CSVから自動マッピング: ${n}件`); };
+document.getElementById('mapStd').onclick=()=>{ let n=0;CANON_HUMANOID.forEach(h=>{ if(MMD_DEFAULT[h]){tl.boneMap[h]=MMD_DEFAULT[h];n++;} });
+  renderMapTable();sendBoneMap();toast(`標準MMD名で補完: ${n}件`); };
+document.getElementById('mapClear').onclick=()=>{ tl.boneMap={};renderMapTable();sendBoneMap(); };
+document.getElementById('mapClose').onclick=()=>document.getElementById('mapModal').classList.remove('on');
+
+/* ===== WebSocket クライアント（接続・受信→取込/REC・選択/フレーム送信）===== */
+let ws=null, rec={on:false,idx:0,clips:{},start:0};
+function wsRoom(){return (document.getElementById('wsId').value||'').trim()||'S0000';}
+function wsStatus(s){const d=document.getElementById('wsDot');
+  d.style.color=s==='on'?'#4ade80':s==='connecting'?'#fbbf24':'var(--dim2)';
+  document.getElementById('wsBtn').textContent=(s==='on'||s==='connecting')?'切断':'接続';}
+function wsSend(o){if(ws&&ws.readyState===1){try{ws.send(JSON.stringify(o));}catch(e){}}}
+function sendBoneMap(){ wsSend({type:'bonemap',id:wsRoom(),map:tl.boneMap}); }
+function wsConnect(){const url=document.getElementById('wsUrl').value.trim();
+  if(!url){toast('接続先URLを入力してください');return;}
+  try{ws=new WebSocket(url);}catch(e){toast('URLが不正: '+e.message);ws=null;return;}
+  wsStatus('connecting');
+  const tmo=setTimeout(()=>{if(ws&&ws.readyState!==1){toast('接続できませんでした（サーバ/URLを確認）');try{ws.close();}catch(e){}ws=null;wsStatus('off');}},8000);
+  ws.onopen=()=>{clearTimeout(tmo);wsStatus('on');toast('WS接続（ID: '+wsRoom()+'）');wsSend({type:'hello',role:'timeline',name:'timeline',id:wsRoom()});
+    if(pmxSkeleton)wsSend({type:'skeleton',space:pmxSkeleton.space,source:pmxSkeleton.source,bones:pmxSkeleton.bones});  // 既読の骨格を共有
+    if(Object.keys(tl.boneMap).length)sendBoneMap();};                                                                  // 既存マッピングを共有
+  ws.onclose=()=>{clearTimeout(tmo);ws=null;wsStatus('off');toast('WS切断');};
+  ws.onerror=()=>{toast('接続できませんでした（サーバ/URLを確認）');};
+  ws.onmessage=ev=>{let m;try{m=JSON.parse(ev.data);}catch(e){return;}onWsMessage(m);};}
+function wsDisconnect(){if(ws){try{ws.close();}catch(e){}}ws=null;wsStatus('off');}
+function onWsMessage(m){
+  if(m.type==='take')importMocap(m,m.name||'take');                  // テイク → 取込
+  else if(m.type==='frame'){if(rec.on)recFrame(m.frame);}            // フレーム → REC中なら記録
+  else if(m.type==='control'){if(m.cmd==='stream:started')toast('サーバ配信 開始');else if(m.cmd==='stream:stopped')toast('サーバ配信 停止');}
+  else if(m.type==='state'){                                         // 他クライアントからの選択/フレーム
+    if(m.what==='frame'&&typeof m.frame==='number')window.tlSync.setFrame(m.frame);
+    else if(m.what==='bones'){                                        // 正規名 or トラックID で選択
+      let ids=Array.isArray(m.ids)?m.ids.slice():[];
+      if(Array.isArray(m.names)){const byCanon=m.names.map(n=>{const t=trackByCanon(poseNameToCanon(n));return t&&t.id;}).filter(Boolean);if(byCanon.length)ids=byCanon;}
+      if(ids.length)window.tlSync.selectBones(ids);}}
+  else if(m.type==='pose'){applyRemotePose(m.bones);}                // 関節角 → 現在フレームにキー(アンカー)書込
+  else if(m.type==='skeleton'&&Array.isArray(m.bones)){              // 受信した骨格 → 保持＋uname反映
+    pmxSkeleton={type:'skeleton',space:m.space||'unity',source:m.source||'pmx',bones:m.bones};
+    pmxHumanoidByName={}; m.bones.forEach(b=>{if(b&&b.humanoid)pmxHumanoidByName[b.name]=b.humanoid;});
+    const n=applySkeletonToTracks(); buildBoneMapFromSkeleton(false); document.getElementById('pmxSkelDl').disabled=false; refresh();
+    if(document.getElementById('mapModal').classList.contains('on'))renderMapTable();
+    toast(`PMX骨格 受信: ${m.bones.length}ボーン / トラック反映 ${n}`);
+  }
+  else if(m.type==='bonemap'&&m.map&&typeof m.map==='object'){      // 受信したマッピング → 反映
+    tl.boneMap=Object.assign({},m.map);
+    if(document.getElementById('mapModal').classList.contains('on'))renderMapTable();
+    toast(`マッピング受信: ${Object.keys(m.map).length}件`);
+  }
+}
+// 受信ポーズを現在フレームのキーとして書き込む（トラック/クリップが無ければ生成＝アンカー作成）
+function canon(t){return t.uname||t.name;}                          // 共有キー（当面=Unity英名）
+function trackByCanon(c){return tl.tracks.find(t=>t.type==='bone'&&(t.uname||t.name)===c);}
+// 受信ボーン名→正規名(Humanoid)へ解決：首=Neck を同一視（既存トラック / CSV由来 / マッピング表 / 標準別名 の順）
+function poseNameToCanon(nm){
+  if(trackByCanon(nm))return nm;                                    // 既にトラックに一致（正規名やそのままの名前）
+  if(pmxHumanoidByName[nm])return pmxHumanoidByName[nm];            // PMX名→Humanoid（CSV読込で構築）
+  for(const h in tl.boneMap){ if(tl.boneMap[h]===nm)return h; }     // マッピング表の値(PMX名)→Humanoidキー
+  if(typeof ALIAS2HUMANOID!=='undefined'&&ALIAS2HUMANOID[nm])return ALIAS2HUMANOID[nm]; // 標準別名(首/左腕…)→Humanoid
+  return nm;                                                        // 解決できなければそのまま
+}
+function applyRemotePose(bones){
+  if(!bones)return; _src='remote'; const ph=Math.round(playhead);
+  const putKey=(clip,ch,lf,v)=>{const a=clip.keys[ch];if(!a)return;
+    const k=a.find(k=>k.f===lf);const val=Array.isArray(v)?v.slice():v;
+    if(k)k.v=val;else{a.push({f:lf,v:val});a.sort((p,q)=>p.f-q.f);}};
+  for(const nm in bones){const b=bones[nm];
+    const cn=poseNameToCanon(nm);                                   // 首→Neck 等に解決
+    let t=trackByCanon(cn);
+    if(!t)t=tl.addTrack({name:cn,uname:cn,type:'bone',color:pickCol()});   // 無ければ正規名で生成
+    let c=t.clips.find(c=>c.contains(ph));
+    if(!c)c=t.addClip({name:'anchor',start:ph,len:1});             // アンカーが無ければ作る
+    const lf=ph-c.start;
+    if(Array.isArray(b.rot))putKey(c,'rot',lf,b.rot);
+    if(Array.isArray(b.pos))putKey(c,'pos',lf,b.pos);}
+  refresh(); _src='local';
+}
+// 現在フレームの各ボーンの局所回転を送出（→ bone_quat 等へ）。キーは正規名(Unity英名)。
+function sendPose(){
+  if((!ws||ws.readyState!==1)&&window.parent===window)return; const ph=Math.round(playhead),out={};
+  tl.tracks.forEach(t=>{if(t.type!=='bone'||!t.clips.length)return;
+    const p=t.sample(ph);if(p&&p.rot){out[canon(t)]={rot:p.rot};if(p.pos)out[canon(t)].pos=p.pos;}});
+  const msg={type:'pose',bones:out,frame:ph};
+  // マッスルトラック（Humanoid クリップ由来）は、ここで Humanoid の骨の回転に直して bones に入れる（muscle_pose.js）。
+  // 同じ骨にボーントラックがあればそちらを使う。
+  // 腰の位置 pos はボーン編集の内蔵骨格（腰の高さ REST_HIPS_Y）基準の移動量：RootT × (REST_HIPS_Y / 先頭フレームの RootT.y) − レスト位置。
+  // VRM 画面が自分の腰の高さで合わせ直せるよう、元の RootT（rootT）と先頭フレームの RootT（msg.rootT0）も付ける。
+  const mt=tl.tracks.filter(t=>t.type==='muscle'&&t.clips.length);
+  if(mt.length&&window.MusclePose){
+    const mv=f=>{const o={};mt.forEach(t=>{const p=t.sample(f);if(p&&Number.isFinite(+p.w))o[t.name]=+p.w;});return o;};
+    const skip={};Object.keys(out).forEach(k=>{skip[k]=1;skip[poseNameToCanon(k)]=1;});
+    const mb=window.MusclePose.musclesToBones(mv(ph),skip);
+    const v0={};mt.forEach(t=>{if(/^RootT\./.test(t.name)){const q=t.sample(0);if(q&&Number.isFinite(+q.w))v0[t.name]=+q.w;}});
+    const y0=v0['RootT.y'];
+    for(const n in mb){const o={rot:mb[n].rot};
+      if(n==='Hips'&&mb.Hips.rootT&&Number.isFinite(y0)&&Math.abs(y0)>1e-4){const s=REST_HIPS_Y/y0,t=mb.Hips.rootT;
+        o.pos=[t[0]*s,t[1]*s-REST_HIPS_Y,t[2]*s];o.rootT=t.slice();msg.rootT0=[v0['RootT.x'],y0,v0['RootT.z']];}
+      out[n]=o;}
+  }
+  // 新しいモーションを読み込んだ直後は、受け手の姿勢をいったん T ポーズに戻させる（前のモーションの骨が残らないように）
+  if(_poseResetNext){msg.reset=true;_poseResetNext=false;}
+  if(Object.keys(out).length||msg.reset)wsSend(msg);
+}
+const REST_HIPS_Y=1.0;       // ボーン編集の内蔵骨格の腰の高さ（bone_editor.html の BONES の Hips）
+let _poseResetNext=false;    // 次の sendPose で reset を付ける
+// REC: 受信frameに含まれるボーン/モーフへライブ追記（1フレーム=1キー）
+function ensureRecTrack(name,type){return tl.tracks.find(t=>t.type===type&&t.name===name)||tl.addTrack({name,type,color:pickCol()});}
+function recStart(){rec={on:true,idx:0,clips:{},start:Math.round(playhead)};toast('REC 開始（受信フレームを記録）');}
+function recStop(){rec.on=false;const ids=Object.values(rec.clips).map(c=>c.id);
+  if(ids.length){const b=tl.addBundle({name:'REC',color:'#fb7185',clipIds:ids});sel={type:'bundle',bundle:b};marked=[];keySel=[];}
+  refresh();toast('REC 停止: '+ids.length+'トラック記録');}
+function recFrame(frame){let added=false;
+  const put=(c,ch,v)=>{const a=c.keys[ch];if(a)a.push({f:rec.idx,v:Array.isArray(v)?v.slice():v});};
+  const get=(name,type)=>{const t=ensureRecTrack(name,type);let c=rec.clips[t.id];
+    if(!c){c=t.addClip({name:'REC',start:rec.start,len:1});rec.clips[t.id]=c;added=true;}return c;};
+  if(frame&&frame.bones)for(const nm in frame.bones){const b=frame.bones[nm],c=get(nm,'bone');
+    if(b.rot)put(c,'rot',b.rot.length===4?Q.norm(b.rot):Q.fromEuler(b.rot[0],b.rot[1],b.rot[2]));
+    if(b.pos)put(c,'pos',[+b.pos[0],+b.pos[1],+b.pos[2]]);c.len=Math.max(c.len,rec.idx+1);}
+  if(frame&&frame.morphs)for(const nm in frame.morphs){const c=get(nm,'morph');put(c,'w',+frame.morphs[nm]);c.len=Math.max(c.len,rec.idx+1);}
+  rec.idx++;playhead=rec.start+rec.idx;
+  if(added)refresh();else{draw();renderPose();syncPlay();}}
+document.getElementById('wsBtn').onclick=()=>{ws?wsDisconnect():wsConnect();};
+document.getElementById('wsId').onchange=()=>{if(ws&&ws.readyState===1)wsSend({type:'hello',role:'timeline',name:'timeline',id:wsRoom()});};
+document.getElementById('wsRec').onchange=function(){this.checked?recStart():recStop();};
+bus.on('frameChange',p=>{if(p.source==='local'){wsSend({type:'state',what:'frame',frame:p.frame});sendPose();}}); // 選択/フレーム/ポーズを送信
+bus.on('boneChange',p=>{if(p.source==='local'){
+  const names=p.ids.map(id=>{const t=tl.tracks.find(t=>t.id===id);return t?canon(t):null;}).filter(Boolean);
+  wsSend({type:'state',what:'bones',ids:p.ids,names});}});
+bus.on('keyEdit',p=>{if(p.source==='local')sendPose();});      // アンカー(キー)編集 → ポーズ送出
+bus.on('dataChange',p=>{if(p.source==='local')sendPose();});   // クリップ等の操作 → ポーズ送出
+wsStatus('off');
+
+/* JSON */
+const modal=document.getElementById('modal'),ta=document.getElementById('ta');
+document.getElementById('exp').onclick=()=>{document.getElementById('modalTitle').textContent='JSON保存';
+  ta.value=JSON.stringify(tl.toJSON(),null,1);ta.readOnly=true;document.getElementById('mLoad').style.display='none';modal.classList.add('on');};
+document.getElementById('imp').onclick=()=>{document.getElementById('modalTitle').textContent='JSON貼付';
+  ta.value='';ta.readOnly=false;document.getElementById('mLoad').style.display='';modal.classList.add('on');};
+document.getElementById('mClose').onclick=()=>modal.classList.remove('on');
+document.getElementById('mLoad').onclick=()=>{try{tl=MotionTimeline.fromJSON(JSON.parse(ta.value));window.tl=tl;
+  sel=null;marked=[];playhead=0;scrollY=0;modal.classList.remove('on');refresh();}catch(e){alert('JSON解析エラー: '+e.message);}};
+document.getElementById('mDl').onclick=()=>{const blob=new Blob([JSON.stringify(tl.toJSON(),null,1)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='motion.json';a.click();};
+
+/* toast */
+let toastT;function toast(msg){const e=document.getElementById('toast');e.textContent=msg;e.classList.add('on');
+  clearTimeout(toastT);toastT=setTimeout(()=>e.classList.remove('on'),1600);}
+
+/* キーボード */
+window.addEventListener('keydown',e=>{
+  if(/input|textarea/i.test(e.target.tagName))return;
+  const cmd=e.ctrlKey||e.metaKey;
+  if(cmd&&e.key==='c'){if(sel&&sel.type==='clip'){copyClip(sel.clip);e.preventDefault();}
+    else if(sel&&sel.type==='bundle'){copyBundle(sel.bundle);e.preventDefault();}
+    else if(keySel.length){copyKeys();e.preventDefault();}}
+  else if(cmd&&e.key==='v'){pasteAny();e.preventDefault();}
+  else if(cmd&&e.key==='g'){if(marked.length>=2){doBundle();e.preventDefault();}}
+  else if(!cmd&&(e.key==='k'||e.key==='K')){punchKeys();e.preventDefault();}
+  else if(!cmd&&(e.key==='c'||e.key==='C')){addClipActive();e.preventDefault();}
+  else if(e.code==='Space'){e.preventDefault();document.getElementById('play').click();}
+  else if(e.key==='ArrowRight'){setPlayhead(playhead+(e.shiftKey?10:1));draw();renderPose();}
+  else if(e.key==='ArrowLeft'){setPlayhead(playhead-(e.shiftKey?10:1));draw();renderPose();}
+  else if((e.key==='Delete'||e.key==='Backspace')&&sel){
+    if(sel.type==='clip'){const t=tl.trackOfClip(sel.clip);if(t)t.removeClip(sel.clip);}
+    else if(sel.type==='key'){sel.clip.removeKeyAt(sel.lf);keySel=[];}
+    else if(sel.type==='keyset'){keySel.forEach(k=>k.clip.removeKeyAt(k.lf));keySel=[];}
+    else if(sel.type==='bundle')bUngroup(sel.bundle);
+    sel=null;refresh();}
+});
+
+/* 起動 */
+resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refresh();
+</script>
+
+<style>
+  .bar .grp:has(#wsDot){display:none!important}
+  .bar{padding:5px 8px}
+</style>
+<script>
+(() => {
+  /* ===== PolyLingMotion v1/v2 adapter =====
+     PolyLingの時刻は秒、編集UIはフレーム。
+     接線（tan / posTan / rotTan / sclTan）とラップモードは保持して v2 で書き戻す。
+     キーの元の秒（t0）も保持し、キーが元のフレームにある間は t0 をそのまま書き出す。
+     接線の編集と、接線を使った再生評価は未対応（再生は位置/表情=線形、回転=Slerp）。 */
+  const plClone=v=>v==null?v:JSON.parse(JSON.stringify(v));
+  const plFinite=n=>Number.isFinite(+n);
+  const plVec=(v,n)=>Array.isArray(v)&&v.length>=n&&v.slice(0,n).every(plFinite)?v.slice(0,n).map(Number):null;
+  function plPut(c,ch,f,v,tan,t0){const a=c.keys[ch];if(!a)return;const ex=a.find(k=>k.f===f),val=Array.isArray(v)?v.slice():v;
+    const k=ex||{f};k.v=val;if(tan!=null)k.tan=plClone(tan);else delete k.tan;if(plFinite(t0))k.t0=+t0;else delete k.t0;if(!ex)a.push(k);}
+  function plTrackMaxTime(src){let m=0;(src&&Array.isArray(src.keys)?src.keys:[]).forEach(k=>{if(k&&plFinite(k.t))m=Math.max(m,+k.t);});return m;}
+  function plHasTangents(data){let yes=false;
+    const scan=t=>(t&&Array.isArray(t.keys)?t.keys:[]).forEach(k=>{if(k&&(k.tan||k.posTan||k.rotTan||k.sclTan))yes=true;});
+    ['bones','bakedBones','expressions','muscles','morphs'].forEach(n=>(data[n]||[]).forEach(scan));scan(data.body);return yes;}
+  function plAddTrack(dst,src,type,role,fps,len,clipName){if(!src||typeof src!=='object')return null;
+    const id=String(src.id||src.name||role||'Track');
+    const t=dst.addTrack({name:id,type,color:pickCol(),uname:(role==='bakedBones'&&src.targetKind==='humanoid')?id:null,
+      plRole:role,plTargetKind:src.targetKind||null,preWrapMode:src.preWrapMode||null,postWrapMode:src.postWrapMode||null,
+      plCategory:src.category||null,plProvider:src.provider||null});
+    const c=t.addClip({name:clipName||'PolyLing',start:0,len});
+    (Array.isArray(src.keys)?src.keys:[]).forEach(k=>{if(!k||!plFinite(k.t))return;const f=Math.max(0,Math.round(+k.t*fps));
+      if(type==='bone'){
+        const q=plVec(k.rot,4),p=plVec(k.pos,3),s=plVec(k.scl,3);
+        if(q)plPut(c,'rot',f,Q.norm(q),Array.isArray(k.rotTan)?k.rotTan:null,k.t);
+        if(p)plPut(c,'pos',f,p,Array.isArray(k.posTan)?k.posTan:null,k.t);
+        if(s)plPut(c,'scl',f,s,Array.isArray(k.sclTan)?k.sclTan:null,k.t);
+      }else if(plFinite(k.v))plPut(c,'w',f,+k.v,k.tan&&typeof k.tan==='object'?k.tan:null,k.t);
+    });c._sort();return t;}
+  function importPolyLing(data,fileName){
+    if(!data||data.format!=='PolyLingMotion')throw new Error('format が PolyLingMotion ではありません');
+    const ver=+data.version||1;if(ver!==1&&ver!==2)throw new Error('未対応のversion: '+data.version);
+    const fps=plFinite(data.frameRate)&&+data.frameRate>0?+data.frameRate:30;
+    const expressions=Array.isArray(data.expressions)?data.expressions:(ver===1&&Array.isArray(data.morphs)?data.morphs:[]);
+    const arrays=[data.bones,data.bakedBones,expressions,data.muscles].filter(Array.isArray);let maxT=plFinite(data.duration)?Math.max(0,+data.duration):0;
+    arrays.forEach(a=>a.forEach(t=>maxT=Math.max(maxT,plTrackMaxTime(t))));maxT=Math.max(maxT,plTrackMaxTime(data.body));
+    // 秒→フレームの切り上げは float の誤差（34.0000032 など）で 1 フレーム伸びないよう、わずかな余裕を引く
+    const len=Math.max(1,Math.ceil(maxT*fps-1e-4)+1),nm=String(data.name||fileName||'PolyLingMotion');
+    const dst=new MotionTimeline({fps,plMotion:{format:'PolyLingMotion',version:2,name:nm,space:data.space||'local',loop:!!data.loop,
+      duration:maxT,sourceRest:plClone(Array.isArray(data.sourceRest)?data.sourceRest:[]),metadata:plClone(data.metadata||null)}});
+    (Array.isArray(data.bones)?data.bones:[]).forEach(x=>plAddTrack(dst,x,'bone','bones',fps,len,nm));
+    if(data.body)plAddTrack(dst,data.body,'bone','body',fps,len,nm);
+    (Array.isArray(data.bakedBones)?data.bakedBones:[]).forEach(x=>plAddTrack(dst,x,'bone','bakedBones',fps,len,nm));
+    expressions.forEach(x=>plAddTrack(dst,x,'morph','expressions',fps,len,nm));
+    (Array.isArray(data.muscles)?data.muscles:[]).forEach(x=>plAddTrack(dst,x,'muscle','muscles',fps,len,nm));
+    tl=dst;window.tl=tl;motionSpace=data.space||'local';_retargetBackup=null;_poseResetNext=true;
+    sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;playhead=0;scrollY=0;view.start=0;refresh();notifyFrame();emitState();sendPose();
+    const n=tl.tracks.length,tan=plHasTangents(data);
+    toast(`PolyLing v${ver} 読込: ${n}トラック / ${fps}fps${tan?'（接線は保持・再生は線形）':''}`);return n;
+  }
+  function plKeyMap(t,fps){const map=new Map();
+    [...t.clips].sort((a,b)=>a.start-b.start).forEach(c=>t.channels.forEach(ch=>(c.keys[ch.name]||[]).forEach(k=>{
+      const f=Math.max(0,Math.round(c.start+k.f));let o=map.get(f);if(!o){o={f};map.set(f,o);}
+      if(plFinite(k.t0)&&Math.round(+k.t0*fps)===f&&o.t0==null)o.t0=+k.t0;   // 動かしていないキーは元の秒を使う
+      const tan=k.tan!=null?plClone(k.tan):null;
+      if(ch.name==='rot'){const q=plVec(k.v,4);if(q){o.rot=Q.norm(q);if(Array.isArray(tan))o.rotTan=tan;}}
+      else if(ch.name==='pos'){const v=plVec(k.v,3);if(v){o.pos=v;if(Array.isArray(tan))o.posTan=tan;}}
+      else if(ch.name==='scl'){const v=plVec(k.v,3);if(v){o.scl=v;if(Array.isArray(tan))o.sclTan=tan;}}
+      else if(ch.name==='w'&&plFinite(k.v)){o.v=+k.v;if(tan&&!Array.isArray(tan)&&typeof tan==='object')o.tan=tan;}
+    })));return [...map.values()].sort((a,b)=>a.f-b.f);}
+  const plNegTan=tn=>{if(!tn||typeof tn!=='object')return tn;const o=Object.assign({},tn);
+    if(plFinite(o.inTangent))o.inTangent=-o.inTangent;if(plFinite(o.outTangent))o.outTangent=-o.outTangent;return o;};
+  function plWrap(v,fallback='Clamp'){return typeof v==='string'&&v?v:fallback;}
+  function plMakeTrack(t,fps,targetKind){const rows=plKeyMap(t,fps),keys=rows.map(r=>{const k={t:r.t0!=null?r.t0:+(r.f/fps).toFixed(7)};
+      if(r.pos)k.pos=r.pos;if(r.rot)k.rot=r.rot;if(r.scl)k.scl=r.scl;if(plFinite(r.v))k.v=r.v;
+      if(r.posTan)k.posTan=r.posTan;if(r.rotTan)k.rotTan=r.rotTan;if(r.sclTan)k.sclTan=r.sclTan;if(r.tan)k.tan=r.tan;return k;});
+    // 回転の半球をそろえる。符号を反転したキーは rotTan の傾きも反転する（重みとモードはそのまま）
+    let prev=null;keys.forEach(k=>{if(!k.rot)return;if(prev&&prev[0]*k.rot[0]+prev[1]*k.rot[1]+prev[2]*k.rot[2]+prev[3]*k.rot[3]<0){
+      k.rot=k.rot.map(v=>-v);if(Array.isArray(k.rotTan))k.rotTan=k.rotTan.map(plNegTan);}prev=k.rot;});
+    return{id:String((targetKind==='humanoid'&&t.uname)||t.name||t.id),targetKind,
+      preWrapMode:plWrap(t.preWrapMode),postWrapMode:plWrap(t.postWrapMode,t.clips.some(c=>c.loop)?'Loop':'Clamp'),keys};}
+  function exportPolyLing(){const meta=tl.plMotion||{},fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30;
+    const out={format:'PolyLingMotion',version:2,name:String(meta.name||'Motion'),frameRate:fps,duration:0,
+      space:meta.space||'local',loop:!!meta.loop,bones:[],expressions:[],muscles:[],body:null,bakedBones:[],
+      sourceRest:plClone(Array.isArray(meta.sourceRest)?meta.sourceRest:[]),metadata:plClone(meta.metadata||{createdWith:'Motion Studio'})};
+    let maxF=0;tl.tracks.forEach(t=>t.clips.forEach(c=>maxF=Math.max(maxF,c.start+Math.max(0,c.len-1))));
+    tl.tracks.forEach(t=>{let role=t.plRole;if(!role)role=t.type==='morph'?'expressions':t.type==='muscle'?'muscles':t.uname?'bakedBones':'bones';
+      if(t.type==='morph'||role==='expressions'){const d=plMakeTrack(t,fps,'scalar');delete d.id;delete d.targetKind;d.name=String(t.name||t.id);
+        if(t.plCategory)d.category=t.plCategory;if(t.plProvider)d.provider=t.plProvider;out.expressions.push(d);return;}
+      if(t.type==='muscle'||role==='muscles'){const d=plMakeTrack(t,fps,'scalar');delete d.id;delete d.targetKind;d.name=String(t.name||t.id);out.muscles.push(d);return;}
+      const allowed=new Set(['boneName','path','humanoid']);let kind=t.plTargetKind||(role==='bakedBones'?'humanoid':'boneName');if(!allowed.has(kind))kind='boneName';
+      if(role==='bones'&&kind==='humanoid')kind='boneName';const d=plMakeTrack(t,fps,kind);
+      if(role==='body'&&!out.body)out.body=d;else if(role==='bakedBones'||kind==='humanoid')out.bakedBones.push(d);else out.bones.push(d);
+    });
+    // 長さが読み込んだときのまま（フレームに直して同じ）なら、元の秒をそのまま書く
+    const d0=meta.duration;out.duration=(plFinite(d0)&&Math.round(+d0*fps)===maxF)?+d0:+(maxF/fps).toFixed(7);return out;}
+  function downloadPolyLing(){const data=exportPolyLing(),safe=(data.name||'motion').replace(/[\\/:*?"<>|]+/g,'_');
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json;charset=utf-8'}),a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);a.download=safe+'.plmotion.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+    toast(`PolyLing v2 保存: ${data.bones.length+data.bakedBones.length+(data.body?1:0)}ボーン / ${data.expressions.length}表情`);}
+  const plLoadBtn=document.getElementById('plLoadBtn'),plFile=document.getElementById('plFile'),plSaveBtn=document.getElementById('plSaveBtn');
+  if(plLoadBtn)plLoadBtn.onclick=()=>plFile.click();if(plSaveBtn)plSaveBtn.onclick=downloadPolyLing;
+  if(plFile)plFile.onchange=function(){const f=this.files&&this.files[0];if(!f)return;const rd=new FileReader();rd.onload=()=>{try{
+      importPolyLing(JSON.parse(rd.result),f.name.replace(/\.plmotion\.json$|\.json$/i,''));}catch(e){alert('PolyLing読込エラー: '+e.message);}};
+    rd.readAsText(f);this.value='';};
+  window.MotionStudioPolyLing={import:importPolyLing,export:exportPolyLing,download:downloadPolyLing};
+  /* ===== VRMA (VRMC_vrm_animation 1.0) 読み書き =====
+     外側の「VRMA読込」「VRMA保存」から使う（command 'vrmaLoadData' / 'vrmaSave'）。
+     書き出しのレスト骨格は下の DEFAULT_SKEL（ボーン編集の内蔵 T ポーズと同じ値）。
+     タイムラインの値の意味はボーン編集ペインの pose と同じ：
+       回転 = 恒等レスト（ワールド軸にそろえたレスト）上のローカル回転、Unity 左手系 [x,y,z,w]
+       Hips 位置 = レスト位置からの差分、Unity 左手系
+     glTF(VRM1) ⇔ Unity は X 反転：回転 (x,y,z,w)⇔(x,-y,-z,w)、位置 (x,y,z)⇔(-x,y,z)。
+     読込の回転変換は @pixiv/three-vrm-animation と同じ（親 Humanoid ボーンのレストワールド回転·q·自分のレストワールド回転^-1）。 */
+  const VRM_PARENT={hips:null,spine:'hips',chest:'spine',upperChest:'chest',neck:'upperChest',head:'neck',leftEye:'head',rightEye:'head',jaw:'head',
+    leftUpperLeg:'hips',leftLowerLeg:'leftUpperLeg',leftFoot:'leftLowerLeg',leftToes:'leftFoot',
+    rightUpperLeg:'hips',rightLowerLeg:'rightUpperLeg',rightFoot:'rightLowerLeg',rightToes:'rightFoot',
+    leftShoulder:'upperChest',leftUpperArm:'leftShoulder',leftLowerArm:'leftUpperArm',leftHand:'leftLowerArm',
+    rightShoulder:'upperChest',rightUpperArm:'rightShoulder',rightLowerArm:'rightUpperArm',rightHand:'rightLowerArm'};
+  ['left','right'].forEach(s=>{VRM_PARENT[s+'ThumbMetacarpal']=s+'Hand';VRM_PARENT[s+'ThumbProximal']=s+'ThumbMetacarpal';VRM_PARENT[s+'ThumbDistal']=s+'ThumbProximal';
+    ['Index','Middle','Ring','Little'].forEach(g=>{VRM_PARENT[s+g+'Proximal']=s+'Hand';VRM_PARENT[s+g+'Intermediate']=s+g+'Proximal';VRM_PARENT[s+g+'Distal']=s+g+'Intermediate';});});
+  const VRM_EXPR_PRESET=new Set(['happy','angry','sad','relaxed','surprised','aa','ih','ou','ee','oh','blink','blinkLeft','blinkRight','lookUp','lookDown','lookLeft','lookRight','neutral']);
+  // Unity HumanBodyBones 名 ⇔ VRM1 humanBones 名（親指だけ段の名前がずれる）
+  const U2V_THUMB={Proximal:'Metacarpal',Intermediate:'Proximal',Distal:'Distal'},V2U_THUMB={Metacarpal:'Proximal',Proximal:'Intermediate',Distal:'Distal'};
+  function u2v(n){n=String(n||'');const m=/^(Left|Right)Thumb(Proximal|Intermediate|Distal)$/.exec(n);
+    if(m)return m[1].toLowerCase()+'Thumb'+U2V_THUMB[m[2]];return n?n[0].toLowerCase()+n.slice(1):n;}
+  function v2u(n){const m=/^(left|right)Thumb(Metacarpal|Proximal|Distal)$/.exec(n);
+    if(m)return (m[1]==='left'?'Left':'Right')+'Thumb'+V2U_THUMB[m[2]];return n[0].toUpperCase()+n.slice(1);}
+  // VRM 未読込時のレスト骨格（ボーン編集ペイン内蔵の T ポーズと同じ値。Unity 左手系・+Z 正面）
+  const DEFAULT_SKEL=(()=>{const T=[['Hips',null,[0,1.00,0]],['Spine','Hips',[0,0.12,0]],['Chest','Spine',[0,0.13,0]],['UpperChest','Chest',[0,0.13,0]],
+    ['Neck','UpperChest',[0,0.12,0]],['Head','Neck',[0,0.10,0]],['LeftShoulder','UpperChest',[-0.06,0.10,0]],['LeftUpperArm','LeftShoulder',[-0.12,0,0]],
+    ['LeftLowerArm','LeftUpperArm',[-0.27,0,0]],['LeftHand','LeftLowerArm',[-0.24,0,0]],['RightShoulder','UpperChest',[0.06,0.10,0]],
+    ['RightUpperArm','RightShoulder',[0.12,0,0]],['RightLowerArm','RightUpperArm',[0.27,0,0]],['RightHand','RightLowerArm',[0.24,0,0]],
+    ['LeftUpperLeg','Hips',[-0.09,-0.06,0]],['LeftLowerLeg','LeftUpperLeg',[0,-0.40,0]],['LeftFoot','LeftLowerLeg',[0,-0.40,0.02]],['LeftToes','LeftFoot',[0,-0.04,0.12]],
+    ['RightUpperLeg','Hips',[0.09,-0.06,0]],['RightLowerLeg','RightUpperLeg',[0,-0.40,0]],['RightFoot','RightLowerLeg',[0,-0.40,0.02]],['RightToes','RightFoot',[0,-0.04,0.12]]];
+    const P={},bones=[];T.forEach(([n,par,o])=>{const pp=par?P[par]:[0,0,0];P[n]=[pp[0]+o[0],pp[1]+o[1],pp[2]+o[2]];bones.push({name:n,parent:par,pos:P[n],humanoid:n});});
+    return{type:'skeleton',space:'unity',source:'default',bones};})();
+
+  // ---- 4x4（glTF と同じ列優先）とクォータニオン [x,y,z,w] ----
+  function m4Compose(t,q,s){const[x,y,z,w]=q,x2=x+x,y2=y+y,z2=z+z,xx=x*x2,xy=x*y2,xz=x*z2,yy=y*y2,yz=y*z2,zz=z*z2,wx=w*x2,wy=w*y2,wz=w*z2;
+    return[(1-(yy+zz))*s[0],(xy+wz)*s[0],(xz-wy)*s[0],0,(xy-wz)*s[1],(1-(xx+zz))*s[1],(yz+wx)*s[1],0,(xz+wy)*s[2],(yz-wx)*s[2],(1-(xx+yy))*s[2],0,t[0],t[1],t[2],1];}
+  function m4Mul(a,b){const r=new Array(16);for(let c=0;c<4;c++)for(let rr=0;rr<4;rr++){let v=0;for(let k=0;k<4;k++)v+=a[k*4+rr]*b[c*4+k];r[c*4+rr]=v;}return r;}
+  function m4Point(m,p){return[m[0]*p[0]+m[4]*p[1]+m[8]*p[2]+m[12],m[1]*p[0]+m[5]*p[1]+m[9]*p[2]+m[13],m[2]*p[0]+m[6]*p[1]+m[10]*p[2]+m[14]];}
+  function m4Rot(m){   // 列を正規化した回転部 → クォータニオン
+    const c=[0,1,2].map(i=>{const v=[m[i*4],m[i*4+1],m[i*4+2]],l=Math.hypot(v[0],v[1],v[2])||1;return[v[0]/l,v[1]/l,v[2]/l];});
+    const m00=c[0][0],m10=c[0][1],m20=c[0][2],m01=c[1][0],m11=c[1][1],m21=c[1][2],m02=c[2][0],m12=c[2][1],m22=c[2][2],tr=m00+m11+m22;let q;
+    if(tr>0){const s=0.5/Math.sqrt(tr+1);q=[(m21-m12)*s,(m02-m20)*s,(m10-m01)*s,0.25/s];}
+    else if(m00>m11&&m00>m22){const s=2*Math.sqrt(1+m00-m11-m22);q=[0.25*s,(m01+m10)/s,(m02+m20)/s,(m21-m12)/s];}
+    else if(m11>m22){const s=2*Math.sqrt(1+m11-m00-m22);q=[(m01+m10)/s,0.25*s,(m12+m21)/s,(m02-m20)/s];}
+    else{const s=2*Math.sqrt(1+m22-m00-m11);q=[(m02+m20)/s,(m12+m21)/s,0.25*s,(m10-m01)/s];}
+    return Q.norm(q);}
+  const qInv=q=>[-q[0],-q[1],-q[2],q[3]];
+  const u2gQ=q=>[q[0],-q[1],-q[2],q[3]], u2gV=v=>[-v[0],v[1],v[2]];   // Unity ⇔ glTF（X 反転、自己逆）
+
+  // ---- GLB 読み ----
+  function glbParse(buf){const dv=new DataView(buf);
+    if(buf.byteLength<20||dv.getUint32(0,true)!==0x46546C67)throw new Error('GLB ではありません');
+    let off=12,json=null,bin=null;
+    while(off+8<=buf.byteLength){const len=dv.getUint32(off,true),type=dv.getUint32(off+4,true),body=buf.slice(off+8,off+8+len);
+      if(type===0x4E4F534A)json=JSON.parse(new TextDecoder().decode(body));else if(type===0x004E4942)bin=body;off+=8+len;}
+    if(!json)throw new Error('JSON チャンクがありません');return{g:json,bin};}
+  function accRead(g,bin,i){const a=g.accessors[i];if(!a)throw new Error('accessor '+i+' がありません');
+    if(a.sparse)throw new Error('sparse accessor は未対応');
+    const n={SCALAR:1,VEC2:2,VEC3:3,VEC4:4,MAT4:16}[a.type],out=new Float32Array(a.count*n);if(a.bufferView==null)return out;
+    const bv=g.bufferViews[a.bufferView];if((bv.buffer||0)!==0||!bin)throw new Error('外部バッファは未対応');
+    const cs={5126:4,5120:1,5121:1,5122:2,5123:2,5125:4}[a.componentType],stride=bv.byteStride||cs*n,base=(bv.byteOffset||0)+(a.byteOffset||0),dv=new DataView(bin);
+    for(let e=0;e<a.count;e++)for(let c=0;c<n;c++){const p=base+e*stride+c*cs;let v;
+      switch(a.componentType){case 5126:v=dv.getFloat32(p,true);break;
+        case 5120:v=dv.getInt8(p);if(a.normalized)v=Math.max(v/127,-1);break;case 5121:v=dv.getUint8(p);if(a.normalized)v/=255;break;
+        case 5122:v=dv.getInt16(p,true);if(a.normalized)v=Math.max(v/32767,-1);break;case 5123:v=dv.getUint16(p,true);if(a.normalized)v/=65535;break;
+        default:v=dv.getUint32(p,true);}
+      out[e*n+c]=v;}
+    return out;}
+  // サンプラ → [{t, v[]}]。CUBICSPLINE は [in, value, out] の value だけを使う
+  function samplerKeys(g,bin,smp,n){const T=accRead(g,bin,smp.input),V=accRead(g,bin,smp.output),cub=smp.interpolation==='CUBICSPLINE',ks=[];
+    for(let i=0;i<T.length;i++){const o=cub?(i*3+1)*n:i*n;ks.push({t:T[i],v:Array.from(V.slice(o,o+n))});}return ks;}
+
+  function importVrma(buf,fileName){
+    const{g,bin}=glbParse(buf),ext=g.extensions&&g.extensions.VRMC_vrm_animation;
+    if(!ext)throw new Error('VRMC_vrm_animation 拡張がありません');
+    const anim=(g.animations||[])[0];if(!anim)throw new Error('アニメーションがありません');
+    const nodes=g.nodes||[],parentOf=new Array(nodes.length).fill(-1);
+    nodes.forEach((nd,i)=>(nd.children||[]).forEach(c=>parentOf[c]=i));
+    const world=new Array(nodes.length);
+    const worldOf=i=>{if(world[i])return world[i];const nd=nodes[i];
+      const L=Array.isArray(nd.matrix)&&nd.matrix.length===16?nd.matrix.slice():m4Compose(nd.translation||[0,0,0],nd.rotation||[0,0,0,1],nd.scale||[1,1,1]);
+      return world[i]=parentOf[i]>=0?m4Mul(worldOf(parentOf[i]),L):L;};
+    const hb=(ext.humanoid&&ext.humanoid.humanBones)||{},boneOfNode=new Map(),nodeOfBone={};
+    for(const nm in hb){const nd=hb[nm]&&hb[nm].node;if(Number.isInteger(nd)){boneOfNode.set(nd,nm);nodeOfBone[nm]=nd;}}
+    const exprOfNode=new Map(),ex=ext.expressions||{};
+    ['preset','custom'].forEach(k=>{const o=ex[k]||{};for(const nm in o){const nd=o[nm]&&o[nm].node;if(Number.isInteger(nd))exprOfNode.set(nd,{name:nm,kind:k});}});
+    if(!('hips' in nodeOfBone))throw new Error('hips がありません');
+    const hipsW=worldOf(nodeOfBone.hips),restHips=m4Point(hipsW,[0,0,0]);
+    const hipsParentW=parentOf[nodeOfBone.hips]>=0?worldOf(parentOf[nodeOfBone.hips]):m4Compose([0,0,0],[0,0,0,1],[1,1,1]);
+    const rotW=nm=>m4Rot(worldOf(nodeOfBone[nm]));
+    const fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30,nm=String(fileName||'VRMA');
+    const items=[];let maxT=0,skipped=0;
+    (anim.channels||[]).forEach(ch=>{const tg=ch.target||{},smp=(anim.samplers||[])[ch.sampler];if(!smp||!Number.isInteger(tg.node))return;
+      const bone=boneOfNode.get(tg.node);
+      if(bone){
+        if(tg.path==='rotation'){let par=VRM_PARENT[bone];while(par&&!(par in nodeOfBone))par=VRM_PARENT[par];
+          const qp=par?rotW(par):m4Rot(hipsParentW),qi=qInv(rotW(bone));
+          const ks=samplerKeys(g,bin,smp,4).map(k=>({t:k.t,v:u2gQ(Q.norm(Q.mul(Q.mul(qp,Q.norm(k.v)),qi)))}));
+          items.push({kind:'rot',name:v2u(bone),keys:ks});ks.forEach(k=>maxT=Math.max(maxT,k.t));}
+        else if(tg.path==='translation'&&bone==='hips'){
+          const ks=samplerKeys(g,bin,smp,3).map(k=>{const w=m4Point(hipsParentW,k.v);return{t:k.t,v:u2gV([w[0]-restHips[0],w[1]-restHips[1],w[2]-restHips[2]])};});
+          items.push({kind:'pos',name:'Hips',keys:ks});ks.forEach(k=>maxT=Math.max(maxT,k.t));}
+        else skipped++;
+        return;}
+      const e=exprOfNode.get(tg.node);
+      if(e&&tg.path==='translation'){const ks=samplerKeys(g,bin,smp,3).map(k=>({t:k.t,v:k.v[0]}));
+        items.push({kind:'w',name:e.name,keys:ks});ks.forEach(k=>maxT=Math.max(maxT,k.t));return;}
+      skipped++;});   // lookAt など
+    const len=Math.max(1,Math.ceil(maxT*fps-1e-4)+1);
+    const dst=new MotionTimeline({fps,plMotion:{format:'PolyLingMotion',version:2,name:nm,space:'local',loop:false,duration:maxT,sourceRest:[],metadata:null}});
+    const bonesT={},morphT={};
+    items.forEach(it=>{let t,c;
+      if(it.kind==='w'){t=morphT[it.name];if(!t){t=morphT[it.name]=dst.addTrack({name:it.name,type:'morph',color:pickCol(),plProvider:'vrm1'});t.addClip({name:nm,start:0,len});}}
+      else{t=bonesT[it.name];if(!t){t=bonesT[it.name]=dst.addTrack({name:it.name,uname:it.name,type:'bone',color:pickCol()});t.addClip({name:nm,start:0,len});}}
+      c=t.clips[0];it.keys.forEach(k=>plPut(c,it.kind,Math.max(0,Math.round(k.t*fps)),it.kind==='w'?+k.v:k.v,null,k.t));c._sort();});
+    tl=dst;window.tl=tl;motionSpace='local';_retargetBackup=null;_poseResetNext=true;
+    sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;playhead=0;scrollY=0;view.start=0;refresh();notifyFrame();emitState();sendPose();
+    toast(`VRMA 読込: ${dst.tracks.length}トラック / ${fps}fps${skipped?`（未対応チャンネル ${skipped} 件を無視）`:''}`);return dst.tracks.length;}
+
+  // ---- VRMA 書出（Hips 平行移動・Humanoid 回転・表情）----
+  function exportVrma(){
+    const fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30;
+    let maxF=0;tl.tracks.forEach(t=>t.clips.forEach(c=>maxF=Math.max(maxF,c.start+Math.max(0,c.len-1))));
+    const skel=DEFAULT_SKEL,posU={};
+    skel.bones.forEach(b=>{const v=u2v(b.humanoid||b.name);if(v in VRM_PARENT&&Array.isArray(b.pos))posU[v]=b.pos;});
+    if(!posU.hips)throw new Error('骨格に Hips がありません');
+    const order=Object.keys(VRM_PARENT).filter(v=>posU[v]),nodes=[],nodeOf={};
+    order.forEach(v=>{let par=VRM_PARENT[v];while(par&&!posU[par])par=VRM_PARENT[par];
+      const p=posU[v],pp=par?posU[par]:[0,0,0];nodeOf[v]=nodes.length;
+      nodes.push({name:v2u(v),translation:u2gV([p[0]-pp[0],p[1]-pp[1],p[2]-pp[2]]),_par:par});});
+    nodes.forEach((n,i)=>{if(n._par){const pn=nodes[nodeOf[n._par]];(pn.children=pn.children||[]).push(i);}});
+    const roots=nodes.map((n,i)=>n._par?-1:i).filter(i=>i>=0);nodes.forEach(n=>delete n._par);
+    const bytes=[];let blen=0;const views=[],accs=[];
+    function addAcc(arr,type,minmax){while(blen%4){bytes.push(new Uint8Array(1));blen++;}
+      const f=new Float32Array(arr),b=new Uint8Array(f.buffer);views.push({buffer:0,byteOffset:blen,byteLength:b.length});bytes.push(b);blen+=b.length;
+      const a={bufferView:views.length-1,componentType:5126,count:arr.length/{SCALAR:1,VEC3:3,VEC4:4}[type],type};
+      if(minmax){a.min=[Math.min(...arr)];a.max=[Math.max(...arr)];}accs.push(a);return accs.length-1;}
+    const frames=[];for(let f=0;f<=maxF;f++)frames.push(f);
+    const tAcc=addAcc(frames.map(f=>f/fps),'SCALAR',true);
+    const channels=[],samplers=[],used=new Set();
+    const addCh=(node,path,out,type)=>{samplers.push({input:tAcc,output:addAcc(out,type),interpolation:'LINEAR'});channels.push({sampler:samplers.length-1,target:{node,path}});};
+    tl.tracks.forEach(t=>{if(t.type!=='bone'||!t.clips.length)return;
+      const v=u2v(poseNameToCanon(canon(t)));if(!(v in nodeOf)||used.has(v))return;used.add(v);
+      const hasRot=t.clips.some(c=>(c.keys.rot||[]).length),hasPos=v==='hips'&&t.clips.some(c=>(c.keys.pos||[]).length);
+      if(hasRot){const out=[];let prev=null;frames.forEach(f=>{let q=u2gQ(Q.norm(t.sample(f).rot||[0,0,0,1]));
+          if(prev&&prev[0]*q[0]+prev[1]*q[1]+prev[2]*q[2]+prev[3]*q[3]<0)q=q.map(x=>-x);prev=q;out.push(...q);});
+        addCh(nodeOf[v],'rotation',out,'VEC4');}
+      if(hasPos){const rh=nodes[nodeOf.hips].translation,out=[];frames.forEach(f=>{const d=u2gV(t.sample(f).pos||[0,0,0]);out.push(rh[0]+d[0],rh[1]+d[1],rh[2]+d[2]);});
+        addCh(nodeOf.hips,'translation',out,'VEC3');}});
+    // マッスルだけで動く骨（Humanoid クリップ）も書く。ボーントラックのある骨はそちらを使う（used 済み）。
+    // 変換は muscle_pose.js。腰の位置は RootT × (レストの腰の高さ / 先頭フレームの RootT.y)。
+    const mTracks=tl.tracks.filter(t=>t.type==='muscle'&&t.clips.length);
+    if(mTracks.length&&window.MusclePose){
+      const mv=f=>{const o={};mTracks.forEach(t=>{const p=t.sample(f);if(p&&Number.isFinite(+p.w))o[t.name]=+p.w;});return o;};
+      const v0=mv(0),y0=v0['RootT.y'],hipsRest=posU.hips;
+      const poses=frames.map(f=>window.MusclePose.musclesToBones(mv(f)));
+      order.forEach(v=>{if(used.has(v))return;const u=v2u(v);if(!poses.some(o=>o[u]))return;used.add(v);
+        const out=[];let prev=null;poses.forEach(o=>{let q=u2gQ(Q.norm((o[u]&&o[u].rot)||[0,0,0,1]));
+          if(prev&&prev[0]*q[0]+prev[1]*q[1]+prev[2]*q[2]+prev[3]*q[3]<0)q=q.map(x=>-x);prev=q;out.push(...q);});
+        addCh(nodeOf[v],'rotation',out,'VEC4');
+        if(v==='hips'&&Number.isFinite(y0)&&Math.abs(y0)>1e-4&&poses.some(o=>o.Hips&&o.Hips.rootT)){
+          const s=hipsRest[1]/y0,tr=[];
+          poses.forEach(o=>{const t=(o.Hips&&o.Hips.rootT)||[0,y0,0];tr.push(...u2gV([t[0]*s,t[1]*s,t[2]*s]));});
+          addCh(nodeOf.hips,'translation',tr,'VEC3');}});
+    }
+    const exprExt={preset:{},custom:{}};let nExpr=0;
+    tl.tracks.forEach(t=>{if(t.type!=='morph'||!t.clips.some(c=>(c.keys.w||[]).length))return;const nm=String(t.name);
+      const kind=VRM_EXPR_PRESET.has(nm)?'preset':'custom';if(exprExt[kind][nm])return;
+      const ni=nodes.length;nodes.push({name:'Expression_'+nm});roots.push(ni);exprExt[kind][nm]={node:ni};nExpr++;
+      const out=[];frames.forEach(f=>{const w=+t.sample(f).w;out.push(Number.isFinite(w)?w:0,0,0);});addCh(ni,'translation',out,'VEC3');});
+    const humanBones={};order.forEach(v=>humanBones[v]={node:nodeOf[v]});
+    const ext={specVersion:'1.0',humanoid:{humanBones}};if(nExpr){ext.expressions={};if(Object.keys(exprExt.preset).length)ext.expressions.preset=exprExt.preset;if(Object.keys(exprExt.custom).length)ext.expressions.custom=exprExt.custom;}
+    const meta=tl.plMotion||{},name=String(meta.name||'Motion');
+    const g={asset:{version:'2.0',generator:'Motion Studio'},extensionsUsed:['VRMC_vrm_animation'],extensions:{VRMC_vrm_animation:ext},
+      scene:0,scenes:[{nodes:roots}],nodes,animations:[{name,channels,samplers}],accessors:accs,bufferViews:views,buffers:[{byteLength:0}]};
+    while(blen%4){bytes.push(new Uint8Array(1));blen++;}g.buffers[0].byteLength=blen;
+    let js=new TextEncoder().encode(JSON.stringify(g));const jpad=(4-js.length%4)%4;
+    if(jpad){const j2=new Uint8Array(js.length+jpad);j2.set(js);j2.fill(0x20,js.length);js=j2;}
+    const total=12+8+js.length+8+blen,out=new Uint8Array(total),dv=new DataView(out.buffer);
+    dv.setUint32(0,0x46546C67,true);dv.setUint32(4,2,true);dv.setUint32(8,total,true);
+    dv.setUint32(12,js.length,true);dv.setUint32(16,0x4E4F534A,true);out.set(js,20);
+    let o=20+js.length;dv.setUint32(o,blen,true);dv.setUint32(o+4,0x004E4942,true);o+=8;bytes.forEach(b=>{out.set(b,o);o+=b.length;});
+    return{name,glb:out,nBones:channels.length-nExpr,nExpr,frames:frames.length};}
+  // 保存は外側が行う（このファイルは別ファイルとして読み込まれ、ここからは保存ダイアログを開けないため）。
+  function sendVrmaFile(){let r;try{r=exportVrma();}catch(e){alert('VRMA保存エラー: '+e.message);return;}
+    const buf=r.glb.buffer.slice(r.glb.byteOffset,r.glb.byteOffset+r.glb.byteLength);
+    parent.postMessage({app:'MotionStudio',from:'timeline',file:{name:r.name.replace(/[\\/:*?"<>|]+/g,'_')+'.vrma',buffer:buf,mime:'model/gltf-binary'}},'*',[buf]);
+    toast(`VRMA 保存: ${r.nBones}チャンネル / 表情${r.nExpr} / ${r.frames}f`);}
+  window.MotionStudioVrma={import:importVrma,export:exportVrma};
+  const nativeSend = wsSend;
+  wsSend = function(payload){
+    nativeSend(payload);
+    parent.postMessage({app:'MotionStudio',from:'timeline',payload}, '*');
+  };
+  let history=[JSON.stringify(tl.toJSON())], historyAt=0, historyTimer=0, restoring=false;
+  function state(){
+    return {frame:Math.round(playhead),playing,selection:selectionSummary(),bones:selectedBoneIds(),canUndo:historyAt>0,canRedo:historyAt<history.length-1};
+  }
+  function report(){ parent.postMessage({app:'MotionStudio',from:'timeline',state:state()}, '*'); }
+  function checkpoint(){
+    if(restoring)return;
+    clearTimeout(historyTimer);
+    historyTimer=setTimeout(()=>{
+      const now=JSON.stringify(tl.toJSON());
+      if(now===history[historyAt])return;
+      history=history.slice(0,historyAt+1);history.push(now);
+      if(history.length>80)history.shift(); else historyAt++;
+      report();
+    },160);
+  }
+  function restoreHistory(step){
+    const next=Math.max(0,Math.min(history.length-1,historyAt+step));if(next===historyAt)return;
+    restoring=true;historyAt=next;tl=MotionTimeline.fromJSON(JSON.parse(history[historyAt]));window.tl=tl;
+    sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;refresh();restoring=false;sendPose();report();
+  }
+  bus.on('frameChange', report);
+  bus.on('selectionChange', report);
+  bus.on('boneChange', report);
+  bus.on('dataChange', report);
+  bus.on('keyEdit', report);
+  bus.on('dataChange', checkpoint);
+  bus.on('keyEdit', checkpoint);
+  const nativeRefresh=refresh;
+  refresh=function(){nativeRefresh();checkpoint();};
+  window.addEventListener('message', ev => {
+    const m=ev.data;
+    if(!m || m.app!=='MotionStudio' || m.to!=='timeline') return;
+    if(m.payload){ onWsMessage(m.payload); report(); return; }
+    switch(m.command){
+      case 'frame': window.tlSync.setFrame(+m.value||0); sendPose(); report(); break;
+      case 'step': window.tlSync.setFrame(Math.max(0,Math.round(playhead)+(+m.value||0))); sendPose(); report(); break;
+      case 'play': document.getElementById('play').click(); report(); break;
+      case 'key': punchKeys(); sendPose(); report(); break;
+      case 'delete': window.dispatchEvent(new KeyboardEvent('keydown',{key:'Delete',bubbles:true})); report(); break;
+      case 'fit': document.getElementById('zFit').click(); report(); break;
+      // ファイルの読み書きは外側が行う。ファイル選択と保存は、利用者が操作した画面でしか開けないため
+      // （このファイルは別ファイルとして読み込まれ、外側のボタン操作はこちらへ伝わらない）。
+      case 'plLoadText': try{importPolyLing(JSON.parse(m.text),String(m.name||'motion').replace(/\.plmotion\.json$|\.json$/i,''));}
+                         catch(e){alert('PolyLing読込エラー: '+e.message);} report(); break;
+      case 'vrmaLoadData': try{importVrma(m.buffer,String(m.name||'VRMA').replace(/\.vrma$/i,''));}catch(e){alert('VRMA読込エラー: '+e.message);} report(); break;
+      case 'vrmaSave': sendVrmaFile(); break;
+      case 'plSave': {const data=exportPolyLing(),safe=(data.name||'motion').replace(/[\\/:*?"<>|]+/g,'_');
+                      parent.postMessage({app:'MotionStudio',from:'timeline',file:{name:safe+'.plmotion.json',text:JSON.stringify(data,null,2)}},'*');
+                      toast(`PolyLing v2 保存: ${data.bones.length+data.bakedBones.length+(data.body?1:0)}ボーン / ${data.expressions.length}表情`);} break;
+      case 'undo': restoreHistory(-1); break;
+      case 'redo': restoreHistory(1); break;
+    }
+  });
+  requestAnimationFrame(() => {
+    parent.postMessage({app:'MotionStudio',from:'timeline',ready:true,state:state()}, '*');
+    notifyFrame(); emitState(); sendPose();
+  });
+})();
+</script>
+
+</body>
+</html>

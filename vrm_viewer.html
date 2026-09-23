@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="ja">
+<!--
+================================================================================
+ VRM 表示  vrm_viewer.html   （motion_studio.html の右上に読み込まれる）
+--------------------------------------------------------------------------------
+ 役割: VRM モデルを表示し、ボーン編集とタイムラインが出す姿勢をそのまま見せる。見るだけ。
+       ほかの画面へは何も送らない（起動完了の ready だけ）。左の骨格にも手を出さない。
+ 外側とのやり取り（一覧は motion_studio.html の先頭）
+   送る : {from:'vrm', ready:true}
+   受ける: {to:'vrm', command:'loadVrm', buffer:ArrayBuffer, name}   VRM ファイルの中身
+          {to:'vrm', payload:{type:'pose', bones:{名前:{rot, pos?}}}}  姿勢（ボーン編集・タイムラインから中継）
+ 姿勢の値の意味（ボーン編集と同じ）
+   回転 rot = レスト（T ポーズ・回転なし）からのローカル回転 [x,y,z,w]、Unity 左手系・キャラは +Z 向き・+X がキャラの右。
+   位置 pos = Hips だけ使う。レスト位置からの移動量。
+   VRM1（glTF 右手系）へは X を反転して当てる：回転 (x,-y,-z,w)、位置 (-x,y,z)。
+   VRM0 は rotateVRM0 で向きをそろえたうえで、@pixiv/three-vrm-animation と同じく x,z をさらに反転する。
+ 名前: Unity の Humanoid 名（Hips / LeftUpperArm など）だけを当てる。それ以外の名前（PMX の日本語名など）は無視する。
+ マッスル: タイムラインが骨の回転に直して bones に入れてくる（muscle_pose.js）。ここでは変換しない。
+ reset:true の pose は、全身を T ポーズに戻してから当てる（新しいモーションを読み込んだ直後）。
+ 視点操作: PolyLing と同じ（polyling_camera.js。ボーン編集と共通）。左ドラッグは使わない。
+   腰: 回転 = RootQ、位置 = RootT × (VRM の腰の高さ / rootT0 の y)。PolyLing の VRMA 変換（モデル不要）と同じ倍率の決め方。
+================================================================================
+-->
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VRM 表示</title>
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+  "@pixiv/three-vrm":"https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.5.5/lib/three-vrm.module.min.js"
+}}
+</script>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#0d1117;color:#cfdae9;font:12px system-ui,"Yu Gothic",sans-serif}
+#view{position:absolute;inset:0}canvas{display:block}
+#msg{position:absolute;left:10px;bottom:8px;color:#77869c;pointer-events:none}
+#fitBtn{position:absolute;left:10px;top:7px;font:inherit;color:#cfdae9;background:#121c29;border:1px solid #26354b;border-radius:5px;height:24px;padding:0 8px;cursor:pointer}
+#fitBtn:hover{border-color:#38bdf8}
+</style>
+</head>
+<body>
+<div id="view"></div>
+<button id="fitBtn" title="モデル全体を表示">全体</button>
+<div id="msg">VRM 未読込（上部の「VRM読込」）</div>
+<script src="polyling_camera.js"></script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+
+// Unity の Humanoid 名 → VRM1 の humanBones 名。親指だけ段の名前がずれる（Unity Proximal = VRM Metacarpal など）。
+const THUMB = { Proximal: 'Metacarpal', Intermediate: 'Proximal', Distal: 'Distal' };
+function unityToVrm(name) {
+  const m = /^(Left|Right)Thumb(Proximal|Intermediate|Distal)$/.exec(name);
+  if (m) return m[1].toLowerCase() + 'Thumb' + THUMB[m[2]];
+  return name ? name[0].toLowerCase() + name.slice(1) : name;
+}
+
+// ---- 表示 ----
+const view = document.getElementById('view'), msg = document.getElementById('msg');
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x0d1117);
+const cam = new PLCamera();   // Unity 座標の視点（PolyLing と同じ）
+const camera = new THREE.PerspectiveCamera(cam.fov, 1, 0.01, 200);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+view.appendChild(renderer.domElement);
+// Unity 座標 → VRM1（glTF）: X を反転
+const toThree = v => new THREE.Vector3(-v[0], v[1], v[2]);
+function applyCamera() {
+  const B = cam.basis();
+  camera.position.copy(toThree(B.pos)); camera.up.copy(toThree(B.up));
+  camera.lookAt(toThree(cam.target));
+}
+cam.attach(renderer.domElement, applyCamera); applyCamera();
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.0));
+const key = new THREE.DirectionalLight(0xffffff, 2.2); key.position.set(1.5, 2.5, 3.0); scene.add(key);
+scene.add(new THREE.GridHelper(10, 20, 0x3b4b61, 0x1b2230));
+
+// 全体表示：PolyLing の ResetToMesh と同じ（注視点 = 範囲の中心、距離 = 範囲の対角 × 1.5）
+function frameModel(obj) {
+  const box = new THREE.Box3().setFromObject(obj); if (box.isEmpty()) return;
+  const size = box.getSize(new THREE.Vector3()), c = box.getCenter(new THREE.Vector3());
+  cam.fit([-c.x, c.y, c.z], size.length()); applyCamera();
+}
+
+// ---- モデルと姿勢 ----
+const loader = new GLTFLoader(); loader.register(p => new VRMLoaderPlugin(p));
+let vrm = null, isV0 = false, restHips = null;
+const lastBones = {};   // 最後に受けた姿勢。モデルを読み直したら掛け直す。
+let rootScaleRef = null; // マッスル由来の腰位置の基準（先頭フレームの RootT）
+
+function applyBones(bones) {
+  if (!vrm || !bones) return;
+  for (const name in bones) {
+    const node = vrm.humanoid.getNormalizedBoneNode(unityToVrm(name));
+    if (!node) continue;
+    const b = bones[name];
+    if (Array.isArray(b.rot) && b.rot.length === 4) {
+      let [x, y, z, w] = b.rot.map(Number); y = -y; z = -z;
+      if (isV0) { x = -x; z = -z; }
+      node.quaternion.set(x, y, z, w).normalize();
+    }
+    if (name === 'Hips' && Array.isArray(b.rootT) && restHips && rootScaleRef && Math.abs(rootScaleRef[1]) > 1e-4) {
+      // マッスル由来：RootT を VRM の腰の高さに合わせた絶対位置
+      const s = restHips.y / rootScaleRef[1];
+      let [tx, ty, tz] = b.rootT.map(Number); tx = -tx;
+      if (isV0) { tx = -tx; tz = -tz; }
+      node.position.set(tx * s, ty * s, tz * s);
+    } else if (name === 'Hips' && Array.isArray(b.pos) && restHips) {
+      let [px, py, pz] = b.pos.map(Number); px = -px;
+      if (isV0) { px = -px; pz = -pz; }
+      node.position.set(restHips.x + px, restHips.y + py, restHips.z + pz);
+    }
+  }
+}
+
+async function loadVrm(buffer, name) {
+  msg.textContent = '読込中: ' + name;
+  try {
+    const gltf = await loader.parseAsync(buffer, '');
+    const nv = gltf.userData.vrm; if (!nv) throw new Error('VRM データが見つかりません');
+    VRMUtils.removeUnnecessaryVertices(gltf.scene);
+    VRMUtils.combineSkeletons(gltf.scene);
+    VRMUtils.rotateVRM0(nv);
+    if (vrm) { scene.remove(vrm.scene); VRMUtils.deepDispose(vrm.scene); }
+    vrm = nv; isV0 = nv.meta && nv.meta.metaVersion === '0';
+    scene.add(vrm.scene);
+    vrm.humanoid.resetNormalizedPose();
+    const hips = vrm.humanoid.getNormalizedBoneNode('hips');
+    restHips = hips ? hips.position.clone() : null;
+    applyBones(lastBones);
+    frameModel(vrm.scene);
+    const m = vrm.meta || {};
+    msg.textContent = `${m.name || m.title || name}（VRM ${isV0 ? '0.x' : '1.0'}）`;
+  } catch (e) { console.error(e); msg.textContent = '読込失敗: ' + (e && e.message || e); }
+}
+document.getElementById('fitBtn').onclick = () => { if (vrm) frameModel(vrm.scene); };
+
+window.addEventListener('message', ev => {
+  const m = ev.data; if (!m || m.app !== 'MotionStudio' || m.to !== 'vrm') return;
+  if (m.command === 'loadVrm' && m.buffer) { loadVrm(m.buffer, String(m.name || 'model.vrm')); return; }
+  const p = m.payload;
+  if (p && p.type === 'pose' && p.bones) {
+    const bones = p.bones;
+    if (Array.isArray(p.rootT0)) rootScaleRef = p.rootT0.map(Number);
+    if (p.reset) {   // 新しいモーション：T ポーズに戻してから当てる
+      for (const k in lastBones) delete lastBones[k];
+      rootScaleRef = Array.isArray(p.rootT0) ? p.rootT0.map(Number) : null;
+      if (vrm) { vrm.humanoid.resetNormalizedPose(); }
+    }
+    Object.assign(lastBones, bones); applyBones(bones);
+  }
+});
+
+function resize() {
+  const w = view.clientWidth || 1, h = view.clientHeight || 1;
+  renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(view); resize();
+const clock = new THREE.Clock();
+(function loop() { requestAnimationFrame(loop); const dt = clock.getDelta(); if (vrm) vrm.update(dt); renderer.render(scene, camera); })();
+parent.postMessage({ app: 'MotionStudio', from: 'vrm', ready: true }, '*');
+</script>
+</body>
+</html>

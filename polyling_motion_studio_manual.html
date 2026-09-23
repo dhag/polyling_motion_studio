@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PolyLing Motion Studio 簡易マニュアル</title>
+<style>
+  :root{
+    --ink:#1d2733;        /* 本文 */
+    --sub:#5b6878;        /* 補足 */
+    --paper:#f6f8fb;      /* 地 */
+    --sheet:#ffffff;      /* 面 */
+    --rule:#d9e0e8;       /* 罫 */
+    --blue:#1f7fc4;       /* ツールのシアンを紙面用に沈めた色 */
+    --pane-bone:#e3effa; --pane-vrm:#eaf5ee; --pane-tl:#f3eefa; --pane-bar:#e9edf2;
+  }
+  *{box-sizing:border-box}
+  html{scroll-padding-top:16px}
+  body{margin:0;background:var(--paper);color:var(--ink);
+       font:15px/1.8 "BIZ UDPGothic","Hiragino Sans","Yu Gothic UI","Yu Gothic","Meiryo",sans-serif;}
+  a{color:var(--blue)}
+  :focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 24px 80px;display:grid;grid-template-columns:200px 1fr;gap:40px}
+  nav{position:sticky;top:24px;align-self:start;font-size:13px;line-height:1.6}
+  nav a{display:block;padding:4px 0 4px 10px;border-left:2px solid var(--rule);color:var(--sub);text-decoration:none}
+  nav a:hover{color:var(--ink);border-left-color:var(--blue)}
+  main{min-width:0}
+  h1{font-size:30px;line-height:1.3;margin:0 0 6px;letter-spacing:.02em}
+  .lead{color:var(--sub);margin:0 0 28px;max-width:44em}
+  h2{font-size:20px;margin:48px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--rule)}
+  h3{font-size:16px;margin:24px 0 6px}
+  p,li{max-width:44em}
+  ul,ol{padding-left:1.4em}
+  kbd{font:12px/1 "BIZ UDPGothic",sans-serif;background:var(--sheet);border:1px solid var(--rule);border-bottom-width:2px;border-radius:4px;padding:2px 6px}
+  .btn{display:inline-block;font-size:13px;line-height:1.4;background:var(--sheet);border:1px solid #b9c6d4;border-radius:5px;padding:1px 8px;white-space:nowrap}
+  table{border-collapse:collapse;width:100%;background:var(--sheet);font-size:14px;margin:8px 0}
+  th,td{border:1px solid var(--rule);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#eef2f6;font-weight:600;white-space:nowrap}
+  .note{background:var(--sheet);border-left:3px solid var(--blue);padding:10px 14px;margin:12px 0;max-width:44em}
+
+  /* 画面の見取り図：ツールの配置をそのまま縮めたもの */
+  .map{background:var(--sheet);border:1px solid var(--rule);border-radius:8px;padding:12px;margin:0 0 8px}
+  .screen{display:grid;grid-template-columns:58fr 42fr;grid-template-rows:auto 150px 130px;gap:6px;font-size:13px}
+  .screen > div{border-radius:5px;padding:8px 10px;line-height:1.5}
+  .screen b{display:block;font-size:14px}
+  .bar{grid-column:1/3;background:var(--pane-bar)}
+  .bone{background:var(--pane-bone)}
+  .vrm{background:var(--pane-vrm)}
+  .tl{grid-column:1/3;background:var(--pane-tl)}
+  .screen span{color:var(--sub)}
+  .caption{font-size:13px;color:var(--sub);margin:0}
+
+  ol.steps{counter-reset:s;list-style:none;padding:0}
+  ol.steps li{counter-increment:s;position:relative;padding:0 0 12px 40px}
+  ol.steps li::before{content:counter(s);position:absolute;left:0;top:1px;width:26px;height:26px;border-radius:50%;
+                      background:var(--blue);color:#fff;font-size:13px;text-align:center;line-height:26px}
+
+  @media (max-width:820px){
+    .wrap{grid-template-columns:1fr;gap:0;padding-top:24px}
+    nav{position:static;margin-bottom:16px;display:flex;flex-wrap:wrap;gap:4px 14px}
+    nav a{border-left:0;padding:2px 0}
+    .screen{grid-template-columns:1fr;grid-template-rows:auto}
+    .bar,.tl{grid-column:auto}
+  }
+  @media print{nav{display:none}.wrap{display:block}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav aria-label="目次">
+  <a href="#map">画面の見取り図</a>
+  <a href="#setup">準備</a>
+  <a href="#first">最初の流れ</a>
+  <a href="#bar">上部のボタン</a>
+  <a href="#camera">視点操作</a>
+  <a href="#bone">ボーン編集</a>
+  <a href="#finger">指モード</a>
+  <a href="#timeline">タイムライン</a>
+  <a href="#files">読み書きできるファイル</a>
+  <a href="#limits">注意と制限</a>
+</nav>
+
+<main>
+<h1>PolyLing Motion Studio 簡易マニュアル</h1>
+<p class="lead">骨格を動かして姿勢を作り、タイムラインにキーを打ってモーションを作るブラウザのツールです。作ったモーションは VRM モデルで確かめ、PolyLing モーションや VRMA として保存できます。</p>
+
+<section id="map">
+<h2>画面の見取り図</h2>
+<div class="map">
+  <div class="screen" role="img" aria-label="画面の配置：上に操作バー、左上にボーン編集、右上に VRM 表示、下にタイムライン">
+    <div class="bar"><b>上部の操作バー</b><span>再生、キー登録、読込・保存、VRM モデル読込</span></div>
+    <div class="bone"><b>ボーン編集（左上）</b><span>骨格を回して姿勢を作る。右側に編集パネル</span></div>
+    <div class="vrm"><b>VRM 表示（右上）</b><span>同じ姿勢を VRM モデルで見る。見るだけ</span></div>
+    <div class="tl"><b>タイムライン（下）</b><span>トラック、クリップ、キーの編集。再生位置の姿勢が上の 2 画面に出る</span></div>
+  </div>
+</div>
+<p class="caption">境界はドラッグで動かせます（上下の境界、左右の境界とも）。</p>
+</section>
+
+<section id="setup">
+<h2>準備</h2>
+<p>次の 6 つのファイルを同じフォルダに置き、<code>polyling_motion_studio.html</code> をブラウザで開きます。</p>
+<table>
+  <tr><th>ファイル</th><th>中身</th></tr>
+  <tr><td>polyling_motion_studio.html</td><td>外側の画面。これを開く</td></tr>
+  <tr><td>bone_editor.html</td><td>ボーン編集</td></tr>
+  <tr><td>vrm_viewer.html</td><td>VRM 表示</td></tr>
+  <tr><td>timeline.html</td><td>タイムライン</td></tr>
+  <tr><td>muscle_pose.js</td><td>マッスル（Unity の Humanoid の値）を骨の回転に直す部品</td></tr>
+  <tr><td>polyling_camera.js</td><td>PolyLing と同じ視点操作の部品</td></tr>
+</table>
+<div class="note">VRM 表示は、表示用の部品（three.js と three-vrm）をインターネットから読み込みます。オフラインでは VRM 表示だけが使えません。</div>
+</section>
+
+<section id="first">
+<h2>最初の流れ</h2>
+<ol class="steps">
+  <li><span class="btn">VRMモデル読込</span> で VRM を選ぶ。右上にモデルが出ます（省略してもかまいません）。</li>
+  <li>既存のモーションから始めるなら <span class="btn">PolyLingモーション読込</span> か <span class="btn">VRMAモーション読込</span>。タイムラインが読み込んだモーションに置き換わり、左右の画面は一度 T ポーズに戻ってから姿勢が当たります。</li>
+  <li>タイムラインの目盛をクリックしてフレームを選び、左の骨格で姿勢を作ります。<span class="btn">自動キー</span> がオンなら、動かすたびにそのフレームへキーが入ります。</li>
+  <li><span class="btn">▶</span>（<kbd>Space</kbd>）で再生して確かめます。</li>
+  <li><span class="btn">PolyLingモーション保存</span> か <span class="btn">VRMAモーション保存</span> で保存します。</li>
+</ol>
+</section>
+
+<section id="bar">
+<h2>上部のボタン</h2>
+<table>
+  <tr><th>ボタン</th><th>働き</th></tr>
+  <tr><td><span class="btn">◀</span> <span class="btn">▶</span> <span class="btn">▶</span></td><td>1 フレーム戻る（<kbd>←</kbd>）、再生と停止（<kbd>Space</kbd>）、1 フレーム進む（<kbd>→</kbd>）</td></tr>
+  <tr><td>フレーム欄</td><td>数字を入れてそのフレームへ移動</td></tr>
+  <tr><td><span class="btn">◆ キー登録</span></td><td>選んでいるトラックへ、今の姿勢のキーを登録（<kbd>K</kbd>）</td></tr>
+  <tr><td><span class="btn">削除</span></td><td>選んでいるキーかクリップを削除（<kbd>Delete</kbd>）</td></tr>
+  <tr><td><span class="btn">↶</span> <span class="btn">↷</span></td><td>元に戻す（<kbd>Ctrl</kbd>+<kbd>Z</kbd>）、やり直す（<kbd>Ctrl</kbd>+<kbd>Y</kbd>）</td></tr>
+  <tr><td>自動キー</td><td>オンのとき、骨を動かすとすぐに今のフレームへ反映</td></tr>
+  <tr><td><span class="btn">姿勢を反映</span></td><td>自動キーがオフのとき、骨の変更をまとめてタイムラインへ送る</td></tr>
+  <tr><td><span class="btn">全体表示</span></td><td>タイムライン全体が見えるように縮める</td></tr>
+  <tr><td><span class="btn">PolyLingモーション読込</span> / <span class="btn">保存</span></td><td>.plmotion.json を読む・保存する</td></tr>
+  <tr><td><span class="btn">VRMモデル読込</span></td><td>右上に VRM を表示する</td></tr>
+  <tr><td><span class="btn">VRMAモーション読込</span> / <span class="btn">保存</span></td><td>.vrma を読む（タイムラインを置き換える）・保存する</td></tr>
+  <tr><td><span class="btn">操作</span></td><td>操作の早見表を開く</td></tr>
+</table>
+</section>
+
+<section id="camera">
+<h2>視点操作</h2>
+<p>ボーン編集と VRM 表示は同じ操作で、PolyLing と同じ向きと速さです。左ドラッグは視点には使いません（ボーン編集では骨の操作に使います）。</p>
+<table>
+  <tr><th>操作</th><th>働き</th></tr>
+  <tr><td>右ドラッグ</td><td>回転（1 ピクセル 0.5 度、上下は ±89 度まで）</td></tr>
+  <tr><td><kbd>Alt</kbd> + 右ドラッグ</td><td>視線まわりの回転</td></tr>
+  <tr><td>中ドラッグ</td><td>平行移動</td></tr>
+  <tr><td>ホイール</td><td>拡大・縮小</td></tr>
+  <tr><td><kbd>Shift</kbd> / <kbd>Ctrl</kbd></td><td>押しながら操作すると 4 倍速 / 0.2 倍速</td></tr>
+</table>
+<p>ボーン編集の <span class="btn">正面</span> <span class="btn">側面</span> <span class="btn">斜め</span> は向きを変えて骨格全体を表示します。VRM 表示の <span class="btn">全体</span> はモデル全体を表示します。</p>
+</section>
+
+<section id="bone">
+<h2>ボーン編集</h2>
+<h3>骨の動かし方</h3>
+<ul>
+  <li><b>関節をつかむ</b>：子の関節（または骨の線）を左ドラッグすると、その親の骨が回ります。手首をつかめば前腕が回ります。</li>
+  <li><b>スライダー</b>：右側の X・Y・Z スライダーで、選んでいる骨の角度（度）を直接変えます。</li>
+  <li><b>回転ハンドル</b>：<span class="btn">回転ハンドル</span> をオンにすると、選んでいる骨に縦線・横線・円のハンドルが出ます。つかんだ側がマウスの向きに付いてきます。</li>
+  <li><span class="btn">腕を初期化</span>（モードによって名前が変わる）で今の編集対象を、<span class="btn">全リセット</span> で全身を T ポーズに戻します。</li>
+</ul>
+<h3>モード</h3>
+<table>
+  <tr><th>モード</th><th>中身</th></tr>
+  <tr><td>腕プリセット</td><td>左上腕・左ひじ・左手首をタブで切り替えて編集</td></tr>
+  <tr><td>全ボーン選択</td><td>一覧から任意の骨を選んで編集（指は出ません）</td></tr>
+  <tr><td>指</td><td>手に寄って指を編集。下の「指モード」を参照</td></tr>
+</table>
+<h3>表示の切り替え</h3>
+<ul>
+  <li><span class="btn">ローカル軸</span>：各骨の向きを赤・緑・青の短い線で表示</li>
+  <li><span class="btn">名称</span>：骨の名前を表示</li>
+  <li>Z回転：視線まわりの回転をスライダーで変える</li>
+</ul>
+<p>全身を操作しているときは、指の骨は表示されず、クリックでも選ばれません。</p>
+</section>
+
+<section id="finger">
+<h2>指モード</h2>
+<p><span class="btn">指</span> を押すと、選んだ手に視点が寄り、その手の指だけが表示されます。<span class="btn">左手</span> <span class="btn">右手</span> で手を切り替え、親指 1〜3 から小指 1〜3 までの 15 個のタブで 1 本ずつ編集できます。</p>
+<h3>手のスライダー</h3>
+<p>次のスライダーは足し合わせて、選んでいる手の指にまとめて当たります。動かすと、その手の指の角度は上書きされます。</p>
+<table>
+  <tr><th>スライダー</th><th>範囲</th><th>働き</th></tr>
+  <tr><td>握る</td><td>−0.2〜1</td><td>指を手のひら側へ曲げる。マイナスは反らせて、びしっと伸ばす</td></tr>
+  <tr><td>広げる</td><td>−1〜1</td><td>指を横に開く。マイナスは閉じる</td></tr>
+  <tr><td>力を抜く</td><td>0〜1</td><td>軽く曲げる。小指ほど深い</td></tr>
+  <tr><td>1 指さし</td><td>0〜1</td><td>人差し指だけ伸ばす</td></tr>
+  <tr><td>2 ピース</td><td>0〜1</td><td>人差し指と中指を伸ばして開く</td></tr>
+  <tr><td>3・4</td><td>0〜1</td><td>伸ばす指を 1 本ずつ増やす</td></tr>
+  <tr><td>5 パー</td><td>0〜1</td><td>全部伸ばして開く</td></tr>
+</table>
+<ul>
+  <li><b>親指を除外</b>（最初はオン）：オンの間は、スライダーで親指を動かしません。親指は 1 本ずつのタブで編集します。</li>
+  <li><b>角度の設定</b>・<b>ハンドサインの設定</b>：開くと、各指・各節の角度（度）や、サインごとの曲げの割合と開きを変えられます。</li>
+</ul>
+</section>
+
+<section id="timeline">
+<h2>タイムライン</h2>
+<table>
+  <tr><th>操作</th><th>方法</th></tr>
+  <tr><td>フレーム移動</td><td>目盛をクリック。上部のフレーム欄や <kbd>←</kbd> <kbd>→</kbd> でも移動</td></tr>
+  <tr><td>キー編集</td><td>トラックの ▸ を開き、菱形のキーをドラッグ。矩形選択、コピー、貼り付け、<kbd>Delete</kbd> が使える</td></tr>
+  <tr><td>クリップ編集</td><td>棒の中央をドラッグして移動、両端をドラッグして長さを変える。重ね合わせ、ループ、ウェイトも使える</td></tr>
+</table>
+<p>再生位置の姿勢は、ボーン編集と VRM 表示の両方に出ます。Unity の Humanoid クリップ由来のマッスルのトラックも、骨の回転に直して表示します。</p>
+</section>
+
+<section id="files">
+<h2>読み書きできるファイル</h2>
+<table>
+  <tr><th>種類</th><th>読込</th><th>保存</th></tr>
+  <tr><td>PolyLing モーション（.plmotion.json）</td><td>version 1・2</td><td>version 2。接線とラップモードは読み込んだまま保存し、動かしていないキーは元の時刻のまま</td></tr>
+  <tr><td>VRMA（.vrma）</td><td>タイムラインを置き換える</td><td>骨の回転・腰の移動・表情を毎フレーム書き出す。マッスルだけのモーションも回転に直して書く</td></tr>
+  <tr><td>VRM（.vrm）</td><td>右上に表示するだけ（1.0 と 0.x）</td><td>—</td></tr>
+</table>
+<p>Unity のアニメーションクリップは、PolyLing（Unity エディタ）のメニュー「Unity クリップ書き出し（PolyLing モーション）」で .plmotion.json にしてから読み込みます。</p>
+</section>
+
+<section id="limits">
+<h2>注意と制限</h2>
+<ul>
+  <li>VRM 表示で動くのは、Unity の Humanoid 名（Hips、LeftUpperArm など）の骨だけです。PMX の日本語名の骨は動きません。</li>
+  <li>VRM 表示に表情は出ません。表情のトラックは VRMA 保存には入ります。</li>
+  <li>接線つきのカーブは、再生では直線でつないで表示します（保存では接線を残します）。接線の編集はできません。</li>
+  <li>VRMA 保存の基準の骨格は、ボーン編集に内蔵の T ポーズです。読み込んだ VRM の骨格は使いません。</li>
+  <li>内蔵骨格の指の長さと位置は目安です。手のスライダーは、T ポーズで手のひらが下を向く骨格を前提にしています。</li>
+  <li>マッスルのうち、上胸（UpperChest）と左右の目は動かしません。</li>
+  <li>ホイールの拡大縮小は PolyLing と同じ式のため、1 目盛で約 0.5% と小さく動きます。</li>
+</ul>
+</section>
+</main>
+</div>
+</body>
+</html>
