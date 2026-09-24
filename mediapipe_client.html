@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>PolyLing MediaPipe クライアント</title>
+<!--
+================================================================================
+ PolyLing MediaPipe クライアント  mediapipe_client.html
+ （単独の画面。モーションスタジオの他のファイルとは読み込み合わない）
+--------------------------------------------------------------------------------
+ カメラ映像を MediaPipe の HolisticLandmarker（@mediapipe/tasks-vision 1.0.1）にかけ、
+ 選んだ部位（顔・ボディ・右手・左手）の生の点群を PolyLing のライブ受信（motionLive）へ WebSocket で送る。
+   ・「1 枚送る」     … 直近の検出結果を 1 件送る
+   ・「リアルタイム送信」… 検出するたびに送る。ブラウザの送信待ち（bufferedAmount）が 0 のときだけ送り、
+                        溜まっていればそのフレームは送らない（見送りとして数える）
+ PolyLing は受けた最新の 1 件だけを保持する（適用・転送はしない）。
+
+ 送る JSON（Duplex 封筒 Text フレーム {type:'push', id, items:[{type:3, mimeType, data:"…"}]} に包む）
+   {type:'mediapipe', seq, time, image:{w,h},
+    face:     {landmarks:[[x,y,z,visibility], …]},                       ← 478 点
+    pose:     {landmarks:[[x,y,z,visibility], …], world:[[x,y,z,visibility], …]},   ← 33 点
+    leftHand: {landmarks:[…], world:[…]},                                ← 21 点
+    rightHand:{landmarks:[…], world:[…]}}                                ← 21 点
+   landmarks … 画像を基準にした正規化座標（x,y は 0〜1、z は MediaPipe の定義どおり）
+   world     … メートル単位（MediaPipe の world landmarks）
+   visibility… MediaPipe の NormalizedLandmark / Landmark の visibility（無ければ null）
+   チェックしていない部位、検出されなかった部位は入れない。値は加工しない。
+   leftHand / rightHand は HolisticLandmarkerResult の leftHandLandmarks / rightHandLandmarks をそのまま使う。
+   time は performance.now() の秒（この画面を開いてからの経過時間）。
+ 画像の検出の依頼（表情転写の BEFORE）
+   PolyLing から {type:'detectImage', requestId, role:'before'} と PNG 画像（Text フレームの封筒で base64）が届いたら、
+   その画像 1 枚を IMAGE モードで検出し、{type:'mediapipe', role:'before', requestId, seq, time, image:{w,h}, face:{landmarks}}
+   を返す（顔だけ。チェックボックスには従わない）。検出中はカメラの検出を止める。
+ カメラ
+   上部のプルダウンで選ぶ。一覧は enumerateDevices のビデオ入力で、最初にカメラを許可した後に作る
+   （許可前はカメラ名が空で返るため）。付け外し（devicechange）で作り直す。
+   選び直すと今の映像を止め、選んだカメラ（deviceId）で開き直す。
+================================================================================
+-->
+<style>
+  :root{--bg:#1e1f22;--pn:#2b2d31;--ln:#3a3c42;--tx:#dcdcdc;--mu:#9aa0a6;--ac:#4a8fe7;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:13px system-ui,-apple-system,"Segoe UI","Yu Gothic UI",sans-serif}
+  .bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:6px 10px;background:var(--pn);border-bottom:1px solid var(--ln)}
+  .bar select{max-width:220px;background:#1b1c1f;color:var(--tx);border:1px solid var(--ln);border-radius:3px;padding:3px 5px}
+  .bar input[type=text]{width:190px;background:#1b1c1f;color:var(--tx);border:1px solid var(--ln);border-radius:3px;padding:3px 5px}
+  .bar button{background:#3a3c42;color:var(--tx);border:1px solid var(--ln);border-radius:3px;padding:4px 10px;cursor:pointer}
+  .bar button.on{background:var(--ac);border-color:var(--ac);color:#fff}
+  .bar button:disabled{opacity:.45;cursor:default}
+  .bar label{display:flex;align-items:center;gap:3px;cursor:pointer}
+  .sep{width:1px;height:20px;background:var(--ln)}
+  #status{color:var(--mu);margin-left:auto}
+  .stage{position:relative;display:flex;justify-content:center;align-items:flex-start;padding:10px}
+  .view{position:relative}
+  video{display:block;max-width:100%;transform:scaleX(-1)}
+  canvas{position:absolute;left:0;top:0;width:100%;height:100%;transform:scaleX(-1);pointer-events:none}
+  .info{padding:0 10px 10px;color:var(--mu);font-size:12px}
+</style>
+</head>
+<body>
+<div class="bar">
+  <select id="cam" title="カメラ"></select>
+  <div class="sep"></div>
+  <input id="url" type="text" value="ws://localhost:12361/" title="PolyLing のライブ受信（パネルのポート）">
+  <button id="btnConn">接続</button>
+  <div class="sep"></div>
+  <label><input id="cFace" type="checkbox" checked>顔</label>
+  <label><input id="cPose" type="checkbox" checked>ボディ</label>
+  <label><input id="cRight" type="checkbox" checked>右手</label>
+  <label><input id="cLeft" type="checkbox" checked>左手</label>
+  <div class="sep"></div>
+  <button id="btnOne" disabled>1 枚送る</button>
+  <button id="btnRt" disabled>リアルタイム送信</button>
+  <span id="status">読込中…</span>
+</div>
+<div class="stage"><div class="view"><video id="video" playsinline muted></video><canvas id="overlay"></canvas></div></div>
+<div class="info" id="info"></div>
+
+<script type="module">
+import { FilesetResolver, HolisticLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs";
+
+const WASM  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task";
+
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+const setStatus = t => { $('status').textContent = t; };
+
+let landmarker = null;
+let latest = null;            // 直近の検出結果（HolisticLandmarkerResult）
+let latestSize = { w: 0, h: 0 };
+let lastVideoTime = -1;
+let ws = null, envId = 0, seq = 0;
+let realtime = false;
+let sent = 0, skipped = 0;
+let busyImage = false;        // 画像の検出の依頼を処理中（カメラの検出を止める）
+
+// ---------------- 起動 ----------------
+async function init() {
+  try {
+    const fileset = await FilesetResolver.forVisionTasks(WASM);
+    const make = delegate => HolisticLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: MODEL, delegate },
+      runningMode: 'VIDEO',
+    });
+    try { landmarker = await make('GPU'); }
+    catch (e) { console.warn('GPU で作れないため CPU にする', e); landmarker = await make('CPU'); }
+  } catch (e) { setStatus('MediaPipe を読み込めません: ' + e.message); return; }
+
+  if (!await openCamera(null)) return;
+  await listCameras();
+  navigator.mediaDevices.addEventListener('devicechange', listCameras);
+  setStatus('準備完了（未接続）');
+  requestAnimationFrame(loop);
+}
+
+// ---------------- カメラ ----------------
+// deviceId が null なら既定のカメラ。開けたら true。
+async function openCamera(deviceId) {
+  const old = video.srcObject;
+  if (old) old.getTracks().forEach(t => t.stop());
+  video.srcObject = null;
+  try {
+    const v = { width: 1280, height: 720 };
+    if (deviceId) v.deviceId = { exact: deviceId };
+    const stream = await navigator.mediaDevices.getUserMedia({ video: v, audio: false });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) { setStatus('カメラを開けません: ' + e.message); return false; }
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  lastVideoTime = -1;
+  latest = null;
+  return true;
+}
+
+// 今使っているカメラの deviceId
+function currentDeviceId() {
+  const tr = video.srcObject ? video.srcObject.getVideoTracks()[0] : null;
+  return tr ? (tr.getSettings().deviceId || '') : '';
+}
+
+async function listCameras() {
+  const sel = $('cam');
+  let devs = [];
+  try { devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'); }
+  catch (e) { setStatus('カメラの一覧を取れません: ' + e.message); return; }
+  const cur = currentDeviceId();
+  sel.innerHTML = '';
+  devs.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId;
+    o.textContent = d.label || `カメラ ${i + 1}`;
+    sel.appendChild(o);
+  });
+  if (cur && devs.some(d => d.deviceId === cur)) sel.value = cur;
+}
+
+$('cam').onchange = async () => {
+  const id = $('cam').value;
+  if (!id || id === currentDeviceId()) return;
+  setStatus('カメラを切り替えています…');
+  if (await openCamera(id)) setStatus(ws ? '接続中' : '準備完了（未接続）');
+};
+
+// ---------------- 検出ループ（映像の新しいフレームごと）----------------
+function loop() {
+  if (!busyImage && video.currentTime !== lastVideoTime && video.readyState >= 2) {
+    lastVideoTime = video.currentTime;
+    latest = landmarker.detectForVideo(video, performance.now());
+    latestSize = { w: video.videoWidth, h: video.videoHeight };
+    draw(latest);
+    if (realtime) sendLatest(true);
+    showInfo();
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---------------- 描画（確認用）----------------
+function draw(r) {
+  if (canvas.width !== video.videoWidth) { canvas.width = video.videoWidth; canvas.height = video.videoHeight; }
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const dots = (list, color, size) => {
+    if (!list || !list[0]) return;
+    ctx.fillStyle = color;
+    for (const p of list[0]) ctx.fillRect(p.x * canvas.width - size / 2, p.y * canvas.height - size / 2, size, size);
+  };
+  if ($('cFace').checked)  dots(r.faceLandmarks, '#7fd4ff', 2);
+  if ($('cPose').checked)  dots(r.poseLandmarks, '#ffd24a', 6);
+  if ($('cRight').checked) dots(r.rightHandLandmarks, '#ff7a7a', 4);
+  if ($('cLeft').checked)  dots(r.leftHandLandmarks, '#7aff9a', 4);
+}
+
+function showInfo() {
+  const n = a => (a && a[0]) ? a[0].length : 0;
+  const r = latest || {};
+  $('info').textContent =
+    `検出: 顔 ${n(r.faceLandmarks)} / ボディ ${n(r.poseLandmarks)} / 右手 ${n(r.rightHandLandmarks)} / 左手 ${n(r.leftHandLandmarks)} 点` +
+    `　送信 ${sent} / 見送り ${skipped}`;
+}
+
+// ---------------- 送る中身 ----------------
+const pts = list => list.map(p => [p.x, p.y, p.z, (p.visibility === undefined ? null : p.visibility)]);
+
+function buildPayload(r) {
+  const m = { type: 'mediapipe', seq: seq++, time: performance.now() / 1000, image: { w: latestSize.w, h: latestSize.h } };
+  const part = (lm, world) => {
+    if (!lm || !lm[0] || lm[0].length === 0) return null;
+    const o = { landmarks: pts(lm[0]) };
+    if (world && world[0] && world[0].length) o.world = pts(world[0]);
+    return o;
+  };
+  let p;
+  if ($('cFace').checked  && (p = part(r.faceLandmarks, null)))                           m.face = p;
+  if ($('cPose').checked  && (p = part(r.poseLandmarks, r.poseWorldLandmarks)))           m.pose = p;
+  if ($('cLeft').checked  && (p = part(r.leftHandLandmarks, r.leftHandWorldLandmarks)))   m.leftHand = p;
+  if ($('cRight').checked && (p = part(r.rightHandLandmarks, r.rightHandWorldLandmarks))) m.rightHand = p;
+  return m;
+}
+
+// Duplex 封筒（Text フレーム）に包んで送る
+function sendLatest(fromRealtime) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !latest) return;
+  if (fromRealtime && ws.bufferedAmount > 0) { skipped++; return; }   // 送信待ちを溜めない
+  const env = { type: 'push', id: ++envId, items: [{ type: 3, mimeType: 'application/json', data: JSON.stringify(buildPayload(latest)) }] };
+  ws.send(JSON.stringify(env));
+  sent++;
+}
+
+// ---------------- 接続 ----------------
+function setConnectedUi(on) {
+  $('btnConn').textContent = on ? '切断' : '接続';
+  $('btnConn').classList.toggle('on', on);
+  $('url').disabled = on;
+  $('btnOne').disabled = !on;
+  $('btnRt').disabled = !on;
+  if (!on) { realtime = false; $('btnRt').classList.remove('on'); $('btnRt').textContent = 'リアルタイム送信'; }
+}
+
+$('btnConn').onclick = () => {
+  if (ws) { const w = ws; ws = null; w.onclose = null; w.close(); setConnectedUi(false); setStatus('切断しました'); return; }
+  let w;
+  try { w = new WebSocket($('url').value.trim()); } catch (e) { setStatus('URL が不正: ' + e.message); return; }
+  ws = w;
+  setStatus('接続しています…');
+  w.onopen  = () => { if (ws === w) { setConnectedUi(true); setStatus('接続中'); } };
+  w.onclose = () => { if (ws === w) { ws = null; setConnectedUi(false); setStatus('接続が切れました'); } };
+  w.onerror = () => { if (ws === w) setStatus('接続できません（PolyLing の受け入れ許可・ポートを確認）'); };
+  // PolyLing からは detectImage だけを使う（muscles などの転送は使わない）
+  w.onmessage = ev => { if (typeof ev.data === 'string') onEnvelope(ev.data); };
+};
+
+// ---------------- PolyLing からの依頼 ----------------
+function onEnvelope(text) {
+  let env; try { env = JSON.parse(text); } catch (e) { return; }
+  const items = Array.isArray(env.items) ? env.items : [];
+  let req = null, png = null;
+  for (const it of items) {
+    const t = it.type | 0;
+    if (t === 3) { try { const j = JSON.parse(it.data); if (j && j.type === 'detectImage') req = j; } catch (e) {} }
+    else if (t === 2 && it.encoding === 'base64') png = it.data;
+  }
+  if (req && png) detectImage(req, png);
+}
+
+async function detectImage(req, pngBase64) {
+  if (!landmarker || busyImage) return;
+  busyImage = true;
+  setStatus('BEFORE の画像を検出しています…');
+  try {
+    const bin = atob(pngBase64), bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/png' }));
+    await landmarker.setOptions({ runningMode: 'IMAGE' });
+    const r = landmarker.detect(bmp);
+    const m = { type: 'mediapipe', role: 'before', requestId: req.requestId, seq: seq++, time: performance.now() / 1000,
+                image: { w: bmp.width, h: bmp.height } };
+    if (r.faceLandmarks && r.faceLandmarks[0] && r.faceLandmarks[0].length) m.face = { landmarks: pts(r.faceLandmarks[0]) };
+    bmp.close();
+    if (ws && ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({ type: 'push', id: ++envId, items: [{ type: 3, mimeType: 'application/json', data: JSON.stringify(m) }] }));
+    setStatus(m.face ? `BEFORE を返しました（顔 ${m.face.landmarks.length} 点）` : 'BEFORE の画像に顔が見つかりませんでした');
+  } catch (e) {
+    setStatus('BEFORE の検出に失敗しました: ' + e.message);
+  } finally {
+    try { await landmarker.setOptions({ runningMode: 'VIDEO' }); } catch (e) {}
+    lastVideoTime = -1;
+    busyImage = false;
+  }
+}
+
+$('btnOne').onclick = () => { sendLatest(false); showInfo(); };
+$('btnRt').onclick = () => {
+  realtime = !realtime;
+  $('btnRt').classList.toggle('on', realtime);
+  $('btnRt').textContent = realtime ? 'リアルタイム送信 停止' : 'リアルタイム送信';
+};
+
+init();
+</script>
+</body>
+</html>

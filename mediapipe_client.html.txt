@@ -1,0 +1,4 @@
+polyling_motion_studio フォルダでコマンドプロンプトを開き、python -m http.server 8000 を実行します（Python が入っていれば使えます）。
+ブラウザで http://localhost:8000/mediapipe_client.html を開きます。
+
+この開き方で、プルダウンにカメラが 2 台出る
