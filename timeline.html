@@ -15,6 +15,10 @@
           {to:'timeline', command:'vrmaSave'}
    plSave / vrmaSave には {from:'timeline', file:{name, text か buffer, mime?}} で中身を返す（保存は外側が行う）
           {to:'timeline', payload:{type:'pose'|'skeleton'|…}}
+          {to:'timeline', payload:{type:'undoGroup', phase:'begin'|'end'}}  ボーン編集のスライダー操作の始めと終わり。
+                                                                        間の姿勢の書き込みを Undo 1 件にまとめる
+ Undo: undo_stack.js の UndoStack に、操作の終わりごとにタイムライン全体の前後の控えを 1 件積む（末尾の「Undo」の節）。
+       ファイル読込・骨 CSV 読込・骨格の受信で履歴を消す。トラック・グループ・バンドルの開閉は対象外。
 ================================================================================
 -->
 <html lang="ja">
@@ -203,6 +207,7 @@
   ::-webkit-scrollbar-track{background:transparent}
 </style>
 <script src="muscle_pose.js"></script>
+<script src="undo_stack.js"></script>
 </head>
 <body>
 
@@ -1041,6 +1046,7 @@ function loadPmxCsv(text,fname){
   refresh();
   toast(`${skel.source==='unity'?'Unity':'PMX'}骨格 取込: ${skel.bones.length}ボーン / Humanoid割当 ${mapped} / トラック反映 ${reflected}`);
   maybeAutoRetarget();
+  window.tlUndo.clearHistory();      // 骨格が変わった＝モデルの変更。履歴を消す
 }
 
 // ===== リターゲット（model1のレストを除去し、model2のレストに乗せる）=====
@@ -1055,6 +1061,7 @@ function loadSrcCsv(text,fname){
   toast(`ソース骨格(model1) 取込: ${skel.bones.length}ボーン / レスト回転あり ${n}`
     + (n?'':'  ※RestW列が無い。UnityBone CSV v2 で出力してください'));
   maybeAutoRetarget();
+  window.tlUndo.clearHistory();      // 骨格が変わった＝モデルの変更。履歴を消す
 }
 // Humanoid列挙名 → レスト・ワールド回転（root相対）の索引。RestWが無ければ空。
 function buildRestIndex(skel){ const m={};
@@ -1213,7 +1220,8 @@ function importMocap(data,name){
   sel={type:'bundle',bundle:b};marked=[];keySel=[];refresh();
   toast(`取込: ${F}f / ${clipIds.length}トラック（${fps}fps, ${start}f〜）`);
   if(fps!==tl.fps)toast(`注: テイク${fps}fps≠プロジェクト${tl.fps}fps（1フレーム=1キーで取込）`);
-  maybeAutoRetarget();}
+  maybeAutoRetarget();
+  window.tlUndo.clearHistory();}                                     // ファイル読込。履歴を消す
 function hover(e){const{x,y}=mpos(e);let cur='default';
   if(bundleHit(x,y)){cv.style.cursor='grab';return;}
   const r=rowAtY(y);
@@ -1445,7 +1453,8 @@ function pruneBundles(){tl.bundles=tl.bundles.filter(b=>bAllClips(b).length>0||b
 function refresh(){normalizeOrder();pruneBundles();layoutRows();scrollY=M.clamp(scrollY,0,maxScroll());
   renderHeads();draw();renderInsp();renderPose();updatePasteBtn();
   document.getElementById('totF').textContent=tl.length;document.getElementById('fpsR').textContent=tl.fps;syncPlay();
-  emitState();}
+  emitState();
+  if(window.tlUndo)window.tlUndo.commit();}   // 操作の終わり。変わっていれば Undo を 1 件積む（ドラッグ中などは積まない）
 
 document.getElementById('play').onclick=function(){playing=!playing;this.textContent=playing?'⏸':'▶';
   this.classList.toggle('pri',!playing);if(playing){last=0;requestAnimationFrame(loop);}};
@@ -1558,11 +1567,14 @@ function onWsMessage(m){
       let ids=Array.isArray(m.ids)?m.ids.slice():[];
       if(Array.isArray(m.names)){const byCanon=m.names.map(n=>{const t=trackByCanon(poseNameToCanon(n));return t&&t.id;}).filter(Boolean);if(byCanon.length)ids=byCanon;}
       if(ids.length)window.tlSync.selectBones(ids);}}
+  else if(m.type==='undoGroup'){                                     // ボーン編集のスライダー操作 → 間の書き込みを Undo 1 件に
+    if(m.phase==='begin')window.tlUndo.suspendRecording();else if(m.phase==='end')window.tlUndo.resumeRecording();}
   else if(m.type==='pose'){applyRemotePose(m.bones);}                // 関節角 → 現在フレームにキー(アンカー)書込
   else if(m.type==='skeleton'&&Array.isArray(m.bones)){              // 受信した骨格 → 保持＋uname反映
     pmxSkeleton={type:'skeleton',space:m.space||'unity',source:m.source||'pmx',bones:m.bones};
     pmxHumanoidByName={}; m.bones.forEach(b=>{if(b&&b.humanoid)pmxHumanoidByName[b.name]=b.humanoid;});
     const n=applySkeletonToTracks(); buildBoneMapFromSkeleton(false); document.getElementById('pmxSkelDl').disabled=false; refresh();
+    window.tlUndo.clearHistory();                                    // 骨格が変わった＝モデルの変更。履歴を消す
     if(document.getElementById('mapModal').classList.contains('on'))renderMapTable();
     toast(`PMX骨格 受信: ${m.bones.length}ボーン / トラック反映 ${n}`);
   }
@@ -1662,7 +1674,7 @@ document.getElementById('imp').onclick=()=>{document.getElementById('modalTitle'
   ta.value='';ta.readOnly=false;document.getElementById('mLoad').style.display='';modal.classList.add('on');};
 document.getElementById('mClose').onclick=()=>modal.classList.remove('on');
 document.getElementById('mLoad').onclick=()=>{try{tl=MotionTimeline.fromJSON(JSON.parse(ta.value));window.tl=tl;
-  sel=null;marked=[];playhead=0;scrollY=0;modal.classList.remove('on');refresh();}catch(e){alert('JSON解析エラー: '+e.message);}};
+  sel=null;marked=[];playhead=0;scrollY=0;modal.classList.remove('on');refresh();window.tlUndo.clearHistory();}catch(e){alert('JSON解析エラー: '+e.message);}};
 document.getElementById('mDl').onclick=()=>{const blob=new Blob([JSON.stringify(tl.toJSON(),null,1)],{type:'application/json'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='motion.json';a.click();};
 
@@ -1674,6 +1686,9 @@ let toastT;function toast(msg){const e=document.getElementById('toast');e.textCo
 window.addEventListener('keydown',e=>{
   if(/input|textarea/i.test(e.target.tagName))return;
   const cmd=e.ctrlKey||e.metaKey;
+  if(cmd&&!e.altKey){const k=e.key.toLowerCase();                  // Undo / Redo（外側と同じキー）
+    if(k==='z'){e.preventDefault();if(e.shiftKey)window.tlUndo.redo();else window.tlUndo.undo();return;}
+    if(k==='y'){e.preventDefault();window.tlUndo.redo();return;}}
   if(cmd&&e.key==='c'){if(sel&&sel.type==='clip'){copyClip(sel.clip);e.preventDefault();}
     else if(sel&&sel.type==='bundle'){copyBundle(sel.bundle);e.preventDefault();}
     else if(keySel.length){copyKeys();e.preventDefault();}}
@@ -1691,6 +1706,63 @@ window.addEventListener('keydown',e=>{
     else if(sel.type==='bundle')bUngroup(sel.bundle);
     sel=null;refresh();}
 });
+
+/* ============================================================================ Undo
+   PolyLing の Undo（UndoStack ＋ MeshUndoController）と同じ組み立て。
+   ・記録 TimelineSnapshotRecord … タイムライン全体の前後の控え（PolyLing の MeshSnapshotRecord 相当）。
+     控えは JSON 文字列。前の記録の「後」と次の記録の「前」は同じ文字列を共有する。
+   ・TimelineUndoController … 操作の終わり（refresh の末尾）で commit し、前回の控えと違えば 1 件積む。
+     次の間は積まない：キャンバスのドラッグ中（drag）、REC 中（rec.on）、一時停止中（suspendRecording）。
+     終わった時点の commit で 1 件にまとまる（PolyLing の SuspendRecording / ResumeRecording 相当）。
+   ・トラック・グループ・バンドルの開閉は控えから外す。戻すときは今の開閉を保つ。
+   ・Undo 後は選択を解除する。 */
+class TimelineSnapshotRecord{
+  constructor(before,after){this.before=before;this.after=after;}
+  undo(ctx){ctx.restore(this.before);}
+  redo(ctx){ctx.restore(this.after);}
+}
+class TimelineUndoController{
+  constructor(){
+    this.onChanged=null;                                              // 履歴が変わったとき（外側のボタン表示の更新）
+    this.stack=new PolyLingUndo.UndoStack({maxSize:50,onChanged:()=>{if(this.onChanged)this.onChanged();}});
+    this._base=null;this._suspend=0;this._restoring=false;}
+  get canUndo(){return this.stack.canUndo;}
+  get canRedo(){return this.stack.canRedo;}
+  snapshot(){const o=tl.toJSON();
+    o.tracks.forEach(t=>{delete t.expanded;});o.groups.forEach(g=>{delete g.collapsed;});o.bundles.forEach(b=>{delete b.collapsed;});
+    return JSON.stringify(o);}
+  _busy(){return this._suspend>0||this._restoring||!!drag||rec.on;}
+  /** 操作の終わり。前回の控えと違えば 1 件積む。 */
+  commit(description){
+    if(this._busy())return false;
+    const now=this.snapshot();
+    if(this._base===null){this._base=now;return false;}
+    if(now===this._base)return false;
+    this.stack.record(new TimelineSnapshotRecord(this._base,now),description||'編集');
+    this._base=now;return true;}
+  suspendRecording(){this._suspend++;}
+  resumeRecording(){if(this._suspend>0)this._suspend--;if(!this._suspend)this.commit();}
+  /** ファイル読込・モデルの変更。今の状態を起点にして履歴を消す。 */
+  clearHistory(){this._suspend=0;this._base=this.snapshot();this.stack.clear();}
+  undo(){if(this._busy())return false;this.commit();return this.stack.performUndo(this);}
+  redo(){if(this._busy())return false;this.commit();return this.stack.performRedo(this);}
+  /** 記録から呼ばれる。控えからタイムラインを作り直す。 */
+  restore(json){
+    const fold={};
+    tl.tracks.forEach(t=>{fold['t:'+t.id]=t.expanded;});tl.groups.forEach(g=>{fold['g:'+g.id]=g.collapsed;});tl.bundles.forEach(b=>{fold['b:'+b.id]=b.collapsed;});
+    this._restoring=true;
+    try{
+      tl=MotionTimeline.fromJSON(JSON.parse(json));window.tl=tl;
+      tl.tracks.forEach(t=>{const v=fold['t:'+t.id];if(v!==undefined)t.expanded=v;});
+      tl.groups.forEach(g=>{const v=fold['g:'+g.id];if(v!==undefined)g.collapsed=v;});
+      tl.bundles.forEach(b=>{const v=fold['b:'+b.id];if(v!==undefined)b.collapsed=v;});
+      sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;
+      refresh();
+    }finally{this._restoring=false;}
+    this._base=this.snapshot();
+    sendPose();}
+}
+window.tlUndo=new TimelineUndoController();
 
 /* 起動 */
 resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refresh();
@@ -1749,6 +1821,7 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
     tl=dst;window.tl=tl;motionSpace=data.space||'local';_retargetBackup=null;_poseResetNext=true;
     sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;playhead=0;scrollY=0;view.start=0;refresh();notifyFrame();emitState();sendPose();
     const n=tl.tracks.length,tan=plHasTangents(data);
+    window.tlUndo.clearHistory();   // ファイル読込。履歴を消す
     toast(`PolyLing v${ver} 読込: ${n}トラック / ${fps}fps${tan?'（接線は保持・再生は線形）':''}`);return n;
   }
   function plKeyMap(t,fps){const map=new Map();
@@ -1913,6 +1986,7 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
       c=t.clips[0];it.keys.forEach(k=>plPut(c,it.kind,Math.max(0,Math.round(k.t*fps)),it.kind==='w'?+k.v:k.v,null,k.t));c._sort();});
     tl=dst;window.tl=tl;motionSpace='local';_retargetBackup=null;_poseResetNext=true;
     sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;playhead=0;scrollY=0;view.start=0;refresh();notifyFrame();emitState();sendPose();
+    window.tlUndo.clearHistory();   // ファイル読込。履歴を消す
     toast(`VRMA 読込: ${dst.tracks.length}トラック / ${fps}fps${skipped?`（未対応チャンネル ${skipped} 件を無視）`:''}`);return dst.tracks.length;}
 
   // ---- VRMA 書出（Hips 平行移動・Humanoid 回転・表情）----
@@ -1990,36 +2064,16 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
     nativeSend(payload);
     parent.postMessage({app:'MotionStudio',from:'timeline',payload}, '*');
   };
-  let history=[JSON.stringify(tl.toJSON())], historyAt=0, historyTimer=0, restoring=false;
   function state(){
-    return {frame:Math.round(playhead),playing,selection:selectionSummary(),bones:selectedBoneIds(),canUndo:historyAt>0,canRedo:historyAt<history.length-1};
+    return {frame:Math.round(playhead),playing,selection:selectionSummary(),bones:selectedBoneIds(),canUndo:window.tlUndo.canUndo,canRedo:window.tlUndo.canRedo};
   }
   function report(){ parent.postMessage({app:'MotionStudio',from:'timeline',state:state()}, '*'); }
-  function checkpoint(){
-    if(restoring)return;
-    clearTimeout(historyTimer);
-    historyTimer=setTimeout(()=>{
-      const now=JSON.stringify(tl.toJSON());
-      if(now===history[historyAt])return;
-      history=history.slice(0,historyAt+1);history.push(now);
-      if(history.length>80)history.shift(); else historyAt++;
-      report();
-    },160);
-  }
-  function restoreHistory(step){
-    const next=Math.max(0,Math.min(history.length-1,historyAt+step));if(next===historyAt)return;
-    restoring=true;historyAt=next;tl=MotionTimeline.fromJSON(JSON.parse(history[historyAt]));window.tl=tl;
-    sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;refresh();restoring=false;sendPose();report();
-  }
+  window.tlUndo.onChanged=report;                                   // 履歴が変わったら外側の ↶ ↷ を更新
   bus.on('frameChange', report);
   bus.on('selectionChange', report);
   bus.on('boneChange', report);
   bus.on('dataChange', report);
   bus.on('keyEdit', report);
-  bus.on('dataChange', checkpoint);
-  bus.on('keyEdit', checkpoint);
-  const nativeRefresh=refresh;
-  refresh=function(){nativeRefresh();checkpoint();};
   window.addEventListener('message', ev => {
     const m=ev.data;
     if(!m || m.app!=='MotionStudio' || m.to!=='timeline') return;
@@ -2040,8 +2094,8 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
       case 'plSave': {const data=exportPolyLing(),safe=(data.name||'motion').replace(/[\\/:*?"<>|]+/g,'_');
                       parent.postMessage({app:'MotionStudio',from:'timeline',file:{name:safe+'.plmotion.json',text:JSON.stringify(data,null,2)}},'*');
                       toast(`PolyLing v2 保存: ${data.bones.length+data.bakedBones.length+(data.body?1:0)}ボーン / ${data.expressions.length}表情`);} break;
-      case 'undo': restoreHistory(-1); break;
-      case 'redo': restoreHistory(1); break;
+      case 'undo': window.tlUndo.undo(); break;
+      case 'redo': window.tlUndo.redo(); break;
     }
   });
   requestAnimationFrame(() => {

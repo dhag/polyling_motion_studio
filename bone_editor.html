@@ -7,6 +7,9 @@
  外側とのやり取り（このファイル末尾の <script> で行う。一覧は motion_studio.html の先頭）
    送る : {from:'bone', ready:true} / {from:'bone', payload:{type:'pose', …}}
           （WebSocket 送信 cwsSend をそのまま外側にも流している）
+          {from:'bone', payload:{type:'undoGroup', phase:'begin'|'end'}}  スライダーを押した／離した（タイムラインが
+                                                                        間の姿勢の書き込みを Undo 1 件にまとめる。外側へだけ送る）
+          {from:'bone', command:'undo'|'redo'}   この画面で押した Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z（外側がタイムラインへ回す）
    受ける: {to:'bone', command:'auto'|'apply'|'reset'} / {to:'bone', payload:{type:'state'|'pose'|'skeleton'}}
 ================================================================================
 -->
@@ -1182,6 +1185,26 @@ updatePanels();
       applyRemotePose(p.bones,p.frame);
     }
     else if(p.type==='skeleton'&&Array.isArray(p.bones)) applySkeleton(p);
+  });
+  // スライダーは動かすたびに姿勢を送るので、押してから離すまでを Undo 1 件にまとめさせる
+  let undoGroupOpen=false;
+  const undoGroup=phase=>parent.postMessage({app:'MotionStudio',from:'bone',payload:{type:'undoGroup',phase}}, '*');
+  document.addEventListener('pointerdown', e => {
+    if(undoGroupOpen || !(e.target instanceof HTMLInputElement) || e.target.type!=='range') return;
+    undoGroupOpen=true; undoGroup('begin');
+  }, true);
+  const endUndoGroup=()=>{ if(!undoGroupOpen) return; undoGroupOpen=false; undoGroup('end'); };
+  window.addEventListener('pointerup', endUndoGroup, true);
+  window.addEventListener('pointercancel', endUndoGroup, true);
+  // Undo / Redo のキーは外側へ回す（この画面を触った後はキーが外側に届かないため）
+  window.addEventListener('keydown', e => {
+    if(/input|textarea|select/i.test(e.target.tagName) && e.target.type!=='range') return;
+    if(!(e.ctrlKey||e.metaKey) || e.altKey) return;
+    const k=e.key.toLowerCase();
+    const command = k==='z' ? (e.shiftKey?'redo':'undo') : k==='y' ? 'redo' : null;
+    if(!command) return;
+    e.preventDefault();
+    parent.postMessage({app:'MotionStudio',from:'bone',command}, '*');
   });
   requestAnimationFrame(() => {
     parent.postMessage({app:'MotionStudio',from:'bone',ready:true}, '*');

@@ -12,6 +12,7 @@
    bone_editor.html   … 左上：ボーン編集（骨格を回して姿勢を作る）
    vrm_viewer.html    … 右上：VRM 表示（姿勢を VRM で見るだけ。何も送り返さない）
    muscle_pose.js     … マッスル → 骨の回転の変換（timeline.html が使う。VRMA 保存と姿勢の送信の両方）
+   undo_stack.js      … Undo の記録の箱（PolyLing の UndoStack 相当。timeline.html が使う）
    polyling_camera.js … PolyLing と同じ視点操作（bone_editor.html と vrm_viewer.html が共通で使う）
    polyling_live.js   … PolyLing のライブ受信の配信（WebSocket）を受ける（この画面が使う）
    timeline.html      … 下：タイムライン（キーとクリップの編集・再生・保存）
@@ -34,11 +35,13 @@
      {ready:true}                        起動完了。bone と timeline がそろうと「統合同期 ON」。
                                          vrm の ready では、タイムラインに今のフレームの姿勢を出し直させる
      {state:{frame,playing,canUndo,canRedo,…}}   (timeline のみ) 上部の表示を更新
+     {command:'undo'|'redo'}             (bone のみ) その画面で押した Ctrl+Z / Y。タイムラインへ回す
      {file:{name,text か buffer,mime?}}  (timeline のみ) plSave / vrmaSave の結果。外側がダウンロードさせる
      {payload:{type:…}}                  外側はもう一方の画面へ中継する
        type:'pose'     {bones:{名前:{rot:[x,y,z,w],pos?:[x,y,z]}}, frame}  姿勢（両方向）
        type:'skeleton' {bones:[{name,parent,pos,humanoid}]}               骨格（timeline → bone）
        type:'state' / 'hello' / 'bonemap'                                  WebSocket 連携用。中継されるが相手は使わないものもある
+       type:'undoGroup' {phase:'begin'|'end'}                             スライダー操作の始めと終わり（bone → timeline）
    各画面は単独でも開ける（その場合は WebSocket 連携の元の動作になる）。
  ライブ受信（上部の「受信開始」）
    PolyLing の「ライブ受信」の配信（既定 ws://localhost:12361/）へつなぐ。こちらからは何も送らない。
@@ -141,6 +144,7 @@ window.addEventListener('message',e=>{
     document.getElementById('undo').disabled=!m.state.canUndo;
     document.getElementById('redo').disabled=!m.state.canRedo;
   }
+  if(m.from==='bone'&&(m.command==='undo'||m.command==='redo'))to('timeline',{command:m.command});
   if(m.file&&m.from==='timeline'){const a=document.createElement('a');
     const blob=m.file.buffer?new Blob([m.file.buffer],{type:m.file.mime||'application/octet-stream'}):new Blob([m.file.text],{type:'application/json;charset=utf-8'});
     a.href=URL.createObjectURL(blob);a.download=m.file.name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
