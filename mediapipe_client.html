@@ -28,9 +28,12 @@
    leftHand / rightHand は HolisticLandmarkerResult の leftHandLandmarks / rightHandLandmarks をそのまま使う。
    time は performance.now() の秒（この画面を開いてからの経過時間）。
  画像の検出の依頼（表情転写の BEFORE）
-   PolyLing から {type:'detectImage', requestId, role:'before'} と PNG 画像（Text フレームの封筒で base64）が届いたら、
-   その画像 1 枚を IMAGE モードで検出し、{type:'mediapipe', role:'before', requestId, seq, time, image:{w,h}, face:{landmarks}}
-   を返す（顔だけ。チェックボックスには従わない）。検出中はカメラの検出を止める。
+   PolyLing から Duplex の要求（封筒 {type:'request', id, items:[{type:3, data:"{\"type\":\"detectImage\"}"},
+   {type:2, mimeType:'image/png', data:base64, encoding:'base64'}]}）が届いたら、その画像 1 枚を IMAGE モードで検出し、
+   同じ id の応答（封筒 {type:'response', id, items:[{type:3, data:"…"}]}）で
+   {type:'mediapipe', seq, time, image:{w,h}, face:{landmarks}} を返す（顔だけ。チェックボックスには従わない）。
+   検出中はカメラの検出を止める。検出中に次の要求が来たとき・失敗したときも、同じ id で
+   {type:'mediapipe', seq, time, image:{w:0,h:0}}（顔なし）を返す（PolyLing を時間切れまで待たせない）。
  カメラ
    上部のプルダウンで選ぶ。一覧は enumerateDevices のビデオ入力で、最初にカメラを許可した後に作る
    （許可前はカメラ名が空で返るため）。付け外し（devicechange）で作り直す。
@@ -248,9 +251,10 @@ $('btnConn').onclick = () => {
   w.onmessage = ev => { if (typeof ev.data === 'string') onEnvelope(ev.data); };
 };
 
-// ---------------- PolyLing からの依頼 ----------------
+// ---------------- PolyLing からの依頼（Duplex の要求）----------------
 function onEnvelope(text) {
   let env; try { env = JSON.parse(text); } catch (e) { return; }
+  if (env.type !== 'request') return;   // push（muscles の転送など）は使わない
   const items = Array.isArray(env.items) ? env.items : [];
   let req = null, png = null;
   for (const it of items) {
@@ -258,11 +262,20 @@ function onEnvelope(text) {
     if (t === 3) { try { const j = JSON.parse(it.data); if (j && j.type === 'detectImage') req = j; } catch (e) {} }
     else if (t === 2 && it.encoding === 'base64') png = it.data;
   }
-  if (req && png) detectImage(req, png);
+  if (req && png) detectImage(env.id, png);
 }
 
-async function detectImage(req, pngBase64) {
-  if (!landmarker || busyImage) return;
+// 要求と同じ封筒 id で応答を返す
+function reply(envelopeId, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'response', id: envelopeId, items: [{ type: 3, mimeType: 'application/json', data: JSON.stringify(obj) }] }));
+}
+
+// 顔なしの応答（検出できないとき）
+const emptyFrame = () => ({ type: 'mediapipe', seq: seq++, time: performance.now() / 1000, image: { w: 0, h: 0 } });
+
+async function detectImage(envelopeId, pngBase64) {
+  if (!landmarker || busyImage) { reply(envelopeId, emptyFrame()); return; }
   busyImage = true;
   setStatus('BEFORE の画像を検出しています…');
   try {
@@ -271,14 +284,13 @@ async function detectImage(req, pngBase64) {
     const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/png' }));
     await landmarker.setOptions({ runningMode: 'IMAGE' });
     const r = landmarker.detect(bmp);
-    const m = { type: 'mediapipe', role: 'before', requestId: req.requestId, seq: seq++, time: performance.now() / 1000,
-                image: { w: bmp.width, h: bmp.height } };
+    const m = { type: 'mediapipe', seq: seq++, time: performance.now() / 1000, image: { w: bmp.width, h: bmp.height } };
     if (r.faceLandmarks && r.faceLandmarks[0] && r.faceLandmarks[0].length) m.face = { landmarks: pts(r.faceLandmarks[0]) };
     bmp.close();
-    if (ws && ws.readyState === WebSocket.OPEN)
-      ws.send(JSON.stringify({ type: 'push', id: ++envId, items: [{ type: 3, mimeType: 'application/json', data: JSON.stringify(m) }] }));
+    reply(envelopeId, m);
     setStatus(m.face ? `BEFORE を返しました（顔 ${m.face.landmarks.length} 点）` : 'BEFORE の画像に顔が見つかりませんでした');
   } catch (e) {
+    reply(envelopeId, emptyFrame());
     setStatus('BEFORE の検出に失敗しました: ' + e.message);
   } finally {
     try { await landmarker.setOptions({ runningMode: 'VIDEO' }); } catch (e) {}

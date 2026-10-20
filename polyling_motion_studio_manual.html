@@ -106,7 +106,7 @@
   <tr><td>bone_editor.html</td><td>ボーン編集</td></tr>
   <tr><td>vrm_viewer.html</td><td>VRM 表示</td></tr>
   <tr><td>timeline.html</td><td>タイムライン</td></tr>
-  <tr><td>muscle_pose.js</td><td>マッスル（Unity の Humanoid の値）を骨の回転に直す部品</td></tr>
+  <tr><td>plmotion_vrma.js</td><td>PolyLing モーションと VRMA を相互に変換する部品（規則は PolyLing と同じ）</td></tr>
   <tr><td>polyling_camera.js</td><td>PolyLing と同じ視点操作の部品</td></tr>
 </table>
 <div class="note">VRM 表示は、表示用の部品（three.js と three-vrm）をインターネットから読み込みます。オフラインでは VRM 表示だけが使えません。</div>
@@ -210,15 +210,16 @@
   <tr><td>キー編集</td><td>トラックの ▸ を開き、菱形のキーをドラッグ。矩形選択、コピー、貼り付け、<kbd>Delete</kbd> が使える</td></tr>
   <tr><td>クリップ編集</td><td>棒の中央をドラッグして移動、両端をドラッグして長さを変える。重ね合わせ、ループ、ウェイトも使える</td></tr>
 </table>
-<p>再生位置の姿勢は、ボーン編集と VRM 表示の両方に出ます。Unity の Humanoid クリップ由来のマッスルのトラックも、骨の回転に直して表示します。</p>
+<p>再生位置の姿勢は、ボーン編集と VRM 表示の両方に出ます。姿勢は骨のトラック（bakedBones）から作ります。マッスルのトラックは骨に直しません（直せるのは PolyLing だけです）。PolyLing が書いた .plmotion.json には bakedBones が付いているので、そのまま表示できます。マッスルだけの古いファイルは、PolyLing で読んで書き直してから読み込みます。</p>
+<p>マッスルのあるモーションで骨のトラックを変えて保存すると、マッスルと腰（body）のトラックは書きません（食い違うためです）。PolyLing がそのファイルを読むときに、骨のトラックからマッスルを作り直します。</p>
 </section>
 
 <section id="files">
 <h2>読み書きできるファイル</h2>
 <table>
   <tr><th>種類</th><th>読込</th><th>保存</th></tr>
-  <tr><td>PolyLing モーション（.plmotion.json）</td><td>version 1・2</td><td>version 2。接線とラップモードは読み込んだまま保存し、動かしていないキーは元の時刻のまま</td></tr>
-  <tr><td>VRMA（.vrma）</td><td>タイムラインを置き換える</td><td>骨の回転・腰の移動・表情を毎フレーム書き出す。マッスルだけのモーションも回転に直して書く</td></tr>
+  <tr><td>PolyLing モーション（.plmotion.json）</td><td>version 1〜4（version 3 以前の bakedBones と sourceRest は読まない）</td><td>version 4。接線とラップモードは読み込んだまま保存し、動かしていないキーは元の時刻のまま</td></tr>
+  <tr><td>VRMA（.vrma）</td><td>タイムラインを置き換える（骨・表情・視線のトラックになる）</td><td>骨（bakedBones）の回転・腰の移動・表情・視線を毎フレーム書き出す。骨のトラックの無いモーション（マッスルだけ）は書き出せない</td></tr>
   <tr><td>VRM（.vrm）</td><td>右上に表示するだけ（1.0 と 0.x）</td><td>—</td></tr>
 </table>
 <p>Unity のアニメーションクリップは、PolyLing（Unity エディタ）のメニュー「Unity クリップ書き出し（PolyLing モーション）」で .plmotion.json にしてから読み込みます。</p>
@@ -230,9 +231,9 @@
   <li>VRM 表示で動くのは、Unity の Humanoid 名（Hips、LeftUpperArm など）の骨だけです。PMX の日本語名の骨は動きません。</li>
   <li>VRM 表示に表情は出ません。表情のトラックは VRMA 保存には入ります。</li>
   <li>接線つきのカーブは、再生では直線でつないで表示します（保存では接線を残します）。接線の編集はできません。</li>
-  <li>VRMA 保存の基準の骨格は、ボーン編集に内蔵の T ポーズです。読み込んだ VRM の骨格は使いません。</li>
+  <li>VRMA 保存の基準の骨格は、PolyLing の正準骨格（VRM の T ポーズ）です。読み込んだ VRM の骨格は使いません。PolyLing が書く VRMA と同じものになります。</li>
   <li>内蔵骨格の指の長さと位置は目安です。手のスライダーは、T ポーズで手のひらが下を向く骨格を前提にしています。</li>
-  <li>マッスルのうち、上胸（UpperChest）と左右の目は動かしません。</li>
+  <li>ライブ受信で表示するのは、PolyLing が解いて添えた骨（bones）だけです。PolyLing を通っていないフレームは表示しません。</li>
   <li>ホイールの拡大縮小は PolyLing と同じ式のため、1 目盛で約 0.5% と小さく動きます。</li>
 </ul>
 </section>

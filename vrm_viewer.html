@@ -12,14 +12,14 @@
           {to:'vrm', payload:{type:'pose', bones:{名前:{rot, pos?}}}}  姿勢（ボーン編集・タイムラインから中継）
  姿勢の値の意味（ボーン編集と同じ）
    回転 rot = レスト（T ポーズ・回転なし）からのローカル回転 [x,y,z,w]、Unity 左手系・キャラは +Z 向き・+X がキャラの右。
-   位置 pos = Hips だけ使う。レスト位置からの移動量。
+   位置 pos = Hips だけ使う。レスト位置からの移動量（ボーン編集の内蔵骨格の単位。腰の高さ = 1）。
+          VRM には腰の高さの比で当てる：位置 = レストの腰 + pos × VRM の腰の高さ。
    VRM1（glTF 右手系）へは X を反転して当てる：回転 (x,-y,-z,w)、位置 (-x,y,z)。
    VRM0 は rotateVRM0 で向きをそろえたうえで、@pixiv/three-vrm-animation と同じく x,z をさらに反転する。
  名前: Unity の Humanoid 名（Hips / LeftUpperArm など）だけを当てる。それ以外の名前（PMX の日本語名など）は無視する。
- マッスル: タイムラインが骨の回転に直して bones に入れてくる（muscle_pose.js）。ここでは変換しない。
+ マッスル: 扱わない。骨は bakedBones（タイムライン）か PolyLing が解いた bones（ライブ受信）で届く。
  reset:true の pose は、全身を T ポーズに戻してから当てる（新しいモーションを読み込んだ直後）。
  視点操作: PolyLing と同じ（polyling_camera.js。ボーン編集と共通）。左ドラッグは使わない。
-   腰: 回転 = RootQ、位置 = RootT × (VRM の腰の高さ / rootT0 の y)。PolyLing の VRMA 変換（モデル不要）と同じ倍率の決め方。
 ================================================================================
 -->
 <head>
@@ -91,7 +91,7 @@ function frameModel(obj) {
 const loader = new GLTFLoader(); loader.register(p => new VRMLoaderPlugin(p));
 let vrm = null, isV0 = false, restHips = null;
 const lastBones = {};   // 最後に受けた姿勢。モデルを読み直したら掛け直す。
-let rootScaleRef = null; // マッスル由来の腰位置の基準（先頭フレームの RootT）
+const REST_HIPS_Y = 1.0; // pos の単位の腰の高さ（ボーン編集の内蔵骨格。timeline.html の REST_HIPS_Y と同じ）
 
 function applyBones(bones) {
   if (!vrm || !bones) return;
@@ -104,14 +104,9 @@ function applyBones(bones) {
       if (isV0) { x = -x; z = -z; }
       node.quaternion.set(x, y, z, w).normalize();
     }
-    if (name === 'Hips' && Array.isArray(b.rootT) && restHips && rootScaleRef && Math.abs(rootScaleRef[1]) > 1e-4) {
-      // マッスル由来：RootT を VRM の腰の高さに合わせた絶対位置
-      const s = restHips.y / rootScaleRef[1];
-      let [tx, ty, tz] = b.rootT.map(Number); tx = -tx;
-      if (isV0) { tx = -tx; tz = -tz; }
-      node.position.set(tx * s, ty * s, tz * s);
-    } else if (name === 'Hips' && Array.isArray(b.pos) && restHips) {
-      let [px, py, pz] = b.pos.map(Number); px = -px;
+    if (name === 'Hips' && Array.isArray(b.pos) && restHips) {
+      const s = restHips.y / REST_HIPS_Y;   // VRM の腰の高さに合わせる
+      let [px, py, pz] = b.pos.map(v => Number(v) * s); px = -px;
       if (isV0) { px = -px; pz = -pz; }
       node.position.set(restHips.x + px, restHips.y + py, restHips.z + pz);
     }
@@ -146,10 +141,8 @@ window.addEventListener('message', ev => {
   const p = m.payload;
   if (p && p.type === 'pose' && p.bones) {
     const bones = p.bones;
-    if (Array.isArray(p.rootT0)) rootScaleRef = p.rootT0.map(Number);
     if (p.reset) {   // 新しいモーション：T ポーズに戻してから当てる
       for (const k in lastBones) delete lastBones[k];
-      rootScaleRef = Array.isArray(p.rootT0) ? p.rootT0.map(Number) : null;
       if (vrm) { vrm.humanoid.resetNormalizedPose(); }
     }
     Object.assign(lastBones, bones); applyBones(bones);

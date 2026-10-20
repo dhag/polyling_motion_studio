@@ -11,7 +11,7 @@
    polyling_motion_studio.html … この画面
    bone_editor.html   … 左上：ボーン編集（骨格を回して姿勢を作る）
    vrm_viewer.html    … 右上：VRM 表示（姿勢を VRM で見るだけ。何も送り返さない）
-   muscle_pose.js     … マッスル → 骨の回転の変換（timeline.html が使う。VRMA 保存と姿勢の送信の両方）
+   plmotion_vrma.js   … PolyLing モーション ⇄ VRMA の変換（timeline.html が使う。規則の正本は PolyLing の VrmaCodec）
    undo_stack.js      … Undo の記録の箱（PolyLing の UndoStack 相当。timeline.html が使う）
    polyling_camera.js … PolyLing と同じ視点操作（bone_editor.html と vrm_viewer.html が共通で使う）
    polyling_live.js   … PolyLing のライブ受信の配信（WebSocket）を受ける（この画面が使う）
@@ -45,9 +45,10 @@
    各画面は単独でも開ける（その場合は WebSocket 連携の元の動作になる）。
  ライブ受信（上部の「受信開始」）
    PolyLing の「ライブ受信」の配信（既定 ws://localhost:12361/）へつなぐ。こちらからは何も送らない。
-   届いた {type:'muscles'} を muscle_pose.js で骨の回転に直し、{payload:{type:'pose'}} として bone と vrm へ送る
-   （表示だけ。タイムラインには書き込まない）。腰の位置の倍率は、受信開始後に最初に届いたフレームの RootT を
-   基準にする（タイムライン再生の sendPose と同じ決め方）。中身の振り分けは polyling_live.js が type で行う。
+   届いた {type:'muscles'} の bones（PolyLing が正準骨格で解いた Humanoid ローカル回転）と hips（Hips の正規化位置）を
+   {payload:{type:'pose'}} として bone と vrm へ送る（表示だけ。タイムラインには書き込まない）。
+   Hips の pos は hips × ボーン編集の内蔵骨格の腰の高さ（タイムライン再生の sendPose と同じ）。
+   bones の無いフレームは表示しない（マッスルから骨を解けるのは PolyLing だけ）。中身の振り分けは polyling_live.js が type で行う。
 ================================================================================
 -->
 <html lang="ja">
@@ -85,12 +86,12 @@ button,input{font:inherit;color:var(--text);background:#121c29;border:1px solid 
   <button id="apply" title="自動キーOFF時のボーン変更を反映">姿勢を反映</button>
   <div class="sep"></div>
   <button id="fit" title="タイムライン全体を表示">全体表示</button>
-  <button id="load" title="現行PolyLingMotion v1/v2を読み込む">PolyLingモーション読込</button>
-  <button id="save" title="現行PolyLingMotion v2を保存">PolyLingモーション保存</button>
+  <button id="load" title="PolyLingMotion v1〜v4 を読み込む">PolyLingモーション読込</button>
+  <button id="save" title="PolyLingMotion v4 で保存する">PolyLingモーション保存</button>
   <div class="sep"></div>
   <button id="vrmLoad" title="VRM モデルを右上に表示する（見るだけ。左の骨格は変わらない）">VRMモデル読込</button>
   <button id="vrmaLoad" title="VRMA を読み込む（タイムラインを置き換える）">VRMAモーション読込</button>
-  <button id="vrmaSave" title="タイムラインを VRMA として保存する（Humanoid の回転・腰の移動・表情）">VRMAモーション保存</button>
+  <button id="vrmaSave" title="タイムラインを VRMA として保存する（bakedBones の回転・腰の移動・表情・視線）">VRMAモーション保存</button>
   <input id="vrmaFile" type="file" accept=".vrma,.glb" style="display:none">
   <input id="vrmFile" type="file" accept=".vrm" style="display:none">
   <input id="plFile" type="file" accept=".json,.plmotion.json,application/json" style="display:none">
@@ -120,14 +121,13 @@ button,input{font:inherit;color:var(--text);background:#121c29;border:1px solid 
     <tr><td>クリップ編集</td><td>棒の中央をドラッグして移動、両端をドラッグして長さ変更。重ね合わせ、ループ、ウェイトも使える。</td></tr>
     <tr><td>視点操作</td><td>左右の画面とも PolyLing と同じ。右ドラッグ=回転、Alt+右ドラッグ=視線まわりの回転、中ドラッグ=平行移動、ホイール=拡大縮小。Shift で速く、Ctrl で遅く。</td></tr>
     <tr><td>VRM表示</td><td>「VRM読込」でモデルを右上に表示する。見るだけで、左の骨格やタイムラインは変わらない。Unity の Humanoid 名（Hips など）の骨だけが動く。</td></tr>
-    <tr><td>VRMA入出力</td><td>「VRMA読込」はタイムラインを置き換える。「VRMA保存」は Humanoid の骨の回転・腰の移動・表情を毎フレームで書き出す（マッスルだけのモーションは回転に直して書く）。書き出しの基準の骨格はボーン編集の内蔵 T ポーズ。</td></tr>
-    <tr><td>ライブ受信</td><td>PolyLing の「ライブ受信」を受け入れ許可にしてから「受信開始」を押すと、PolyLing が受けたマッスルの姿勢を上の 2 画面に表示する。表示だけで、タイムラインには書き込まない。接続先は PolyLing のパネルの配信ポートに合わせる。</td></tr>
-    <tr><td>PolyLing入出力</td><td>.plmotion.json（v1/v2）を読み込み、現行v2で保存する。秒とフレームはfpsで相互変換する。接線とラップモードは保持して書き戻す。動かしていないキーは元の秒のまま書き出す。</td></tr>
+    <tr><td>VRMA入出力</td><td>「VRMA読込」はタイムラインを置き換える（骨は bakedBones、表情、視線のトラックになる）。「VRMA保存」は bakedBones の回転・腰の移動・表情・視線を毎フレームで書き出す。基準の骨格は PolyLing の正準骨格。bakedBones の無いモーション（マッスルだけ）は書き出せないので、PolyLing で .plmotion を書き直してから読む。</td></tr>
+    <tr><td>ライブ受信</td><td>PolyLing の「ライブ受信」を受け入れ許可にしてから「受信開始」を押すと、PolyLing が解いた骨の姿勢（bones）を上の 2 画面に表示する。表示だけで、タイムラインには書き込まない。接続先は PolyLing のパネルの配信ポートに合わせる。</td></tr>
+    <tr><td>PolyLing入出力</td><td>.plmotion.json（v1〜v4）を読み込み、v4 で保存する。v3 以前の bakedBones と sourceRest は読まない。姿勢の表示は bakedBones から行う。マッスルのあるモーションで bakedBones を変えると、保存時にマッスルと body を書かない（PolyLing が読むときに bakedBones から作り直す）。秒とフレームはfpsで相互変換する。接線とラップモードは保持して書き戻す。動かしていないキーは元の秒のまま書き出す。</td></tr>
   </table>
   <p>PolyLingの位置・スケール・表情・マッスルは線形補間、回転はSlerpである。接線付きカーブは接線を保持して保存するが、接線の編集と、接線を使った再生はまだできない（再生は線形）。ボーン選択・フレーム・ポーズはページ内で直接同期するため、ローカルWebSocketサーバは不要である。</p>
   <div style="text-align:right"><button id="helpClose" class="primary">閉じる</button></div>
 </div></div>
-<script src="muscle_pose.js"></script>
 <script src="polyling_live.js"></script>
 <script>
 const boneFrame=document.getElementById('boneFrame'),timelineFrame=document.getElementById('timelineFrame'),vrmFrame=document.getElementById('vrmFrame');
@@ -177,20 +177,18 @@ vrmFile.onchange=()=>{const f=vrmFile.files&&vrmFile.files[0];vrmFile.value='';i
     to('timeline',{command:'frame',value:+document.getElementById('frame').value||0});});};   // 読んだら今のフレームの姿勢を出し直させる
 /* ===== ライブ受信（PolyLing → WebSocket → 表示）===== */
 const LIVE_REST_HIPS_Y=1.0;   // ボーン編集の内蔵骨格の腰の高さ（timeline.html の REST_HIPS_Y と同じ）
-let liveRootT0=null;           // 受信開始後、最初に届いたフレームの RootT（腰の位置の倍率の基準）
 let liveFirst=true;            // 次の姿勢で T ポーズに戻させる（前の姿勢の骨が残らないように）
+let liveNoBones=0;             // bones の無いフレームの数（表示しない）
 const liveBtn=document.getElementById('liveBtn');
+const liveQ=v=>Array.isArray(v)&&v.length===4&&v.every(x=>Number.isFinite(+x))?v.map(Number):null;
 const live=PolyLingLive.create({
   muscles:m=>{
-    const mv=Object.assign({},m.muscles||{});
-    if(Array.isArray(m.rootQ)&&m.rootQ.length===4)['x','y','z','w'].forEach((k,i)=>mv['RootQ.'+k]=+m.rootQ[i]);
-    if(Array.isArray(m.rootT)&&m.rootT.length===3)['x','y','z'].forEach((k,i)=>mv['RootT.'+k]=+m.rootT[i]);
-    if(!liveRootT0&&Array.isArray(m.rootT)&&m.rootT.length===3)liveRootT0=m.rootT.map(Number);
-    const mb=window.MusclePose.musclesToBones(mv),bones={},msg={type:'pose',bones};
-    for(const n in mb){const o={rot:mb[n].rot};
-      if(n==='Hips'&&mb.Hips.rootT&&liveRootT0&&Math.abs(liveRootT0[1])>1e-4){const k=LIVE_REST_HIPS_Y/liveRootT0[1],t=mb.Hips.rootT;
-        o.pos=[t[0]*k,t[1]*k-LIVE_REST_HIPS_Y,t[2]*k];o.rootT=t.slice();msg.rootT0=liveRootT0.slice();}
-      bones[n]=o;}
+    if(!m.bones||typeof m.bones!=='object'){   // PolyLing を通っていないフレーム。マッスルから骨は解かない
+      liveNoBones++;document.getElementById('status').textContent=`骨の無いフレーム ${liveNoBones} 件（PolyLing 経由で受けてください）`;return;}
+    const bones={},msg={type:'pose',bones};
+    for(const n in m.bones){const q=liveQ(m.bones[n]);if(q)bones[n]={rot:q};}
+    const h=Array.isArray(m.hips)&&m.hips.length===3&&m.hips.every(x=>Number.isFinite(+x))?m.hips.map(Number):null;
+    if(h&&bones.Hips)bones.Hips.pos=h.map(v=>v*LIVE_REST_HIPS_Y);
     if(liveFirst){msg.reset=true;liveFirst=false;}
     to('bone',{payload:msg});to('vrm',{payload:msg});
   },
@@ -200,7 +198,7 @@ const live=PolyLingLive.create({
   onLog:t=>{document.getElementById('status').textContent=t;},
 });
 liveBtn.onclick=()=>{if(live.connected){live.disconnect();return;}
-  liveRootT0=null;liveFirst=true;live.connect(document.getElementById('liveUrl').value.trim());};
+  liveFirst=true;liveNoBones=0;live.connect(document.getElementById('liveUrl').value.trim());};
 const help=document.getElementById('help');document.getElementById('helpBtn').onclick=()=>help.classList.add('on');document.getElementById('helpClose').onclick=()=>help.classList.remove('on');help.onclick=e=>{if(e.target===help)help.classList.remove('on')};
 window.addEventListener('keydown',e=>{if(/input|textarea/i.test(e.target.tagName))return;const mod=e.ctrlKey||e.metaKey;if(mod&&e.key.toLowerCase()==='z'){e.preventDefault();cmd(e.shiftKey?'redo':'undo')}else if(mod&&e.key.toLowerCase()==='y'){e.preventDefault();cmd('redo')}else if(e.code==='Space'){e.preventDefault();cmd('play')}else if(e.key==='ArrowLeft')cmd('step',e.shiftKey?-10:-1);else if(e.key==='ArrowRight')cmd('step',e.shiftKey?10:1);else if(e.key==='k'||e.key==='K')cmd('key');else if(e.key==='Delete')cmd('delete')});
 const vsplit=document.getElementById('vsplit'),boneSub=document.getElementById('boneSub');

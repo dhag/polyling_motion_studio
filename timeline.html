@@ -6,7 +6,9 @@
  役割: キーとクリップの編集・再生、PolyLing モーション（.plmotion.json）の読込と保存。単独で開いても使える。
  外側とのやり取り（このファイル末尾の <script> で行う。一覧は motion_studio.html の先頭）
    送る : {from:'timeline', ready:true, state} / {from:'timeline', state} / {from:'timeline', payload:{type:'pose'|'skeleton'|…}}
-          pose の bones にはマッスルトラックから直した骨の回転も入る（腰は rootT も付き、msg.rootT0 = 先頭フレームの RootT）。
+          pose の bones はボーントラック（bakedBones など）の回転。Hips の pos は「レスト位置からの差 ÷ レストの腰の高さ」
+          × REST_HIPS_Y（ボーン編集の内蔵骨格の腰の高さ）。マッスル・body・lookAt トラックは送らない
+          （マッスルから骨を解けるのは PolyLing だけ。PolyLing が書いた .plmotion には bakedBones が付いている）。
           新しいモーションを読み込んだ直後の pose には reset:true が付く（受け手は T ポーズに戻してから当てる）
           （WebSocket 送信 wsSend をそのまま外側にも流している）
    受ける: {to:'timeline', command:'frame'|'step'|'play'|'key'|'delete'|'fit'|'undo'|'redo'|'plSave'}
@@ -206,7 +208,7 @@
   ::-webkit-scrollbar-thumb{background:#1e2a3c;border-radius:6px}
   ::-webkit-scrollbar-track{background:transparent}
 </style>
-<script src="muscle_pose.js"></script>
+<script src="plmotion_vrma.js"></script>
 <script src="undo_stack.js"></script>
 </head>
 <body>
@@ -1089,7 +1091,7 @@ function applyRetarget(){
     const v=[pos[ch][0]-pos[cn][0],pos[ch][1]-pos[cn][1],pos[ch][2]-pos[cn][2]],n=Math.hypot(v[0],v[1],v[2]);
     return n>1e-9?[v[0]/n,v[1]/n,v[2]/n]:null; };
   const Mx=v=>[-v[0],v[1],v[2]];                               // X面反射（位置/方向）
-  const boneTracks=tl.tracks.filter(t=>t.type==='bone');
+  const boneTracks=tl.tracks.filter(t=>t.type==='bone'&&!isAuxTrack(t));   // body・lookAt は骨でないので対象外
   if(!boneTracks.length){ toast('boneトラックがありません'); return; }
   const byCanon={}; boneTracks.forEach(t=>{ byCanon[canon(t)]=t; });
   const present=new Set(Object.keys(byCanon));
@@ -1137,7 +1139,7 @@ function undoRetarget(){
 // Unity→MMD 左右ミラー: 各ボーンのローカル回転に X面反射の共役 (x,-y,-z,w) を適用（対合＝もう一度で戻る）
 function applyMirrorYZ(){
   let n=0;
-  tl.tracks.filter(t=>t.type==='bone').forEach(t=>{
+  tl.tracks.filter(t=>t.type==='bone'&&!isAuxTrack(t)).forEach(t=>{   // body・lookAt は骨でないので対象外
     t.clips.forEach(c=>{ const a=c.keys&&c.keys.rot; if(!a)return;
       a.forEach(k=>{ const v=k.v; if(Array.isArray(v)&&v.length===4){ k.v=[v[0],-v[1],-v[2],v[3]]; n++; } }); });
   });
@@ -1586,6 +1588,9 @@ function onWsMessage(m){
 }
 // 受信ポーズを現在フレームのキーとして書き込む（トラック/クリップが無ければ生成＝アンカー作成）
 function canon(t){return t.uname||t.name;}                          // 共有キー（当面=Unity英名）
+// 骨でないボーン型トラック：body（PolyLingMotion の body。Humanoid クリップの腰：pos = RootT（bodyPosition）、rot = RootQ（bodyRotation））と
+// lookAt（視線。Head から見た向き）。骨として送る・リターゲット・左右ミラーには使わない。
+function isAuxTrack(t){return t.type==='bone'&&(t.plRole==='body'||t.plRole==='lookAt');}
 function trackByCanon(c){return tl.tracks.find(t=>t.type==='bone'&&(t.uname||t.name)===c);}
 // 受信ボーン名→正規名(Humanoid)へ解決：首=Neck を同一視（既存トラック / CSV由来 / マッピング表 / 標準別名 の順）
 function poseNameToCanon(nm){
@@ -1614,31 +1619,20 @@ function applyRemotePose(bones){
 // 現在フレームの各ボーンの局所回転を送出（→ bone_quat 等へ）。キーは正規名(Unity英名)。
 function sendPose(){
   if((!ws||ws.readyState!==1)&&window.parent===window)return; const ph=Math.round(playhead),out={};
-  tl.tracks.forEach(t=>{if(t.type!=='bone'||!t.clips.length)return;
-    const p=t.sample(ph);if(p&&p.rot){out[canon(t)]={rot:p.rot};if(p.pos)out[canon(t)].pos=p.pos;}});
+  // 骨はボーントラック（bakedBones など）だけから送る。Hips の pos は正規化した差（÷ レストの腰の高さ）なので
+  // ボーン編集の内蔵骨格の腰の高さ REST_HIPS_Y を掛ける。マッスルトラックは骨に直さない（直せるのは PolyLing だけ）。
+  tl.tracks.forEach(t=>{if(t.type!=='bone'||!t.clips.length||isAuxTrack(t))return;
+    const p=t.sample(ph);if(p&&p.rot){const o={rot:p.rot};if(p.pos)o.pos=canon(t)==='Hips'?p.pos.map(v=>v*REST_HIPS_Y):p.pos;out[canon(t)]=o;}});
   const msg={type:'pose',bones:out,frame:ph};
-  // マッスルトラック（Humanoid クリップ由来）は、ここで Humanoid の骨の回転に直して bones に入れる（muscle_pose.js）。
-  // 同じ骨にボーントラックがあればそちらを使う。
-  // 腰の位置 pos はボーン編集の内蔵骨格（腰の高さ REST_HIPS_Y）基準の移動量：RootT × (REST_HIPS_Y / 先頭フレームの RootT.y) − レスト位置。
-  // VRM 画面が自分の腰の高さで合わせ直せるよう、元の RootT（rootT）と先頭フレームの RootT（msg.rootT0）も付ける。
-  const mt=tl.tracks.filter(t=>t.type==='muscle'&&t.clips.length);
-  if(mt.length&&window.MusclePose){
-    const mv=f=>{const o={};mt.forEach(t=>{const p=t.sample(f);if(p&&Number.isFinite(+p.w))o[t.name]=+p.w;});return o;};
-    const skip={};Object.keys(out).forEach(k=>{skip[k]=1;skip[poseNameToCanon(k)]=1;});
-    const mb=window.MusclePose.musclesToBones(mv(ph),skip);
-    const v0={};mt.forEach(t=>{if(/^RootT\./.test(t.name)){const q=t.sample(0);if(q&&Number.isFinite(+q.w))v0[t.name]=+q.w;}});
-    const y0=v0['RootT.y'];
-    for(const n in mb){const o={rot:mb[n].rot};
-      if(n==='Hips'&&mb.Hips.rootT&&Number.isFinite(y0)&&Math.abs(y0)>1e-4){const s=REST_HIPS_Y/y0,t=mb.Hips.rootT;
-        o.pos=[t[0]*s,t[1]*s-REST_HIPS_Y,t[2]*s];o.rootT=t.slice();msg.rootT0=[v0['RootT.x'],y0,v0['RootT.z']];}
-      out[n]=o;}
-  }
+  if(!Object.keys(out).length&&tl.tracks.some(t=>t.type==='muscle'&&t.clips.length)&&!_warnedNoBaked){
+    _warnedNoBaked=true;toast('マッスルだけで骨（bakedBones）がありません。PolyLing で .plmotion を書き直すと bakedBones が付き、姿勢を表示できます');}
   // 新しいモーションを読み込んだ直後は、受け手の姿勢をいったん T ポーズに戻させる（前のモーションの骨が残らないように）
   if(_poseResetNext){msg.reset=true;_poseResetNext=false;}
   if(Object.keys(out).length||msg.reset)wsSend(msg);
 }
 const REST_HIPS_Y=1.0;       // ボーン編集の内蔵骨格の腰の高さ（bone_editor.html の BONES の Hips）
 let _poseResetNext=false;    // 次の sendPose で reset を付ける
+let _warnedNoBaked=false;    // 「bakedBones が無い」を読込ごとに 1 回だけ出す
 // REC: 受信frameに含まれるボーン/モーフへライブ追記（1フレーム=1キー）
 function ensureRecTrack(name,type){return tl.tracks.find(t=>t.type===type&&t.name===name)||tl.addTrack({name,type,color:pickCol()});}
 function recStart(){rec={on:true,idx:0,clips:{},start:Math.round(playhead)};toast('REC 開始（受信フレームを記録）');}
@@ -1774,9 +1768,18 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
 </style>
 <script>
 (() => {
-  /* ===== PolyLingMotion v1/v2 adapter =====
+  /* ===== PolyLingMotion adapter（読込 v1〜v4、保存 v4。PolyLing_VRMA整備計画.md 2.2）=====
      PolyLingの時刻は秒、編集UIはフレーム。
-     接線（tan / posTan / rotTan / sclTan）とラップモードは保持して v2 で書き戻す。
+     bakedBones（正準骨格上の Humanoid ローカル回転。Hips の pos は「レスト位置からの差 ÷ レストの腰の高さ」）が骨の正本。
+     骨の表示と VRMA の書き出しは bakedBones だけから作る（マッスルから骨を解けるのは PolyLing だけ）。
+     腰（Humanoid の RootT / RootQ）は body トラック（id "body"、targetKind "body"、キーの pos / rot）、
+     視線は lookAt トラック（id "lookAt"、targetKind "lookAt"、キーの rot）に入れる。どちらも骨としては扱わない（isAuxTrack）。
+     v3 以前の bakedBones は元モデルのレスト（sourceRest）基準なので読まず、sourceRest も読まない（警告を出す）。
+     muscles に RootT.* / RootQ.* があるファイル（v3 より前の書き方）は PolyLing 側と同じく読まない
+     （PolyLing の convertMotionRootToBody で body トラックへ移してから読む）。
+     保存の決まり：bakedBones は Hips 以外の pos と全部の scl を書かない。muscles があり、bakedBones を読込時から変えたときは
+     muscles と body を書かない（食い違うため。PolyLing が読むときに bakedBones から焼き直す）。
+     接線（tan / posTan / rotTan / sclTan）とラップモードは保持して書き戻す。
      キーの元の秒（t0）も保持し、キーが元のフレームにある間は t0 をそのまま書き出す。
      接線の編集と、接線を使った再生評価は未対応（再生は位置/表情=線形、回転=Slerp）。 */
   const plClone=v=>v==null?v:JSON.parse(JSON.stringify(v));
@@ -1787,7 +1790,7 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
   function plTrackMaxTime(src){let m=0;(src&&Array.isArray(src.keys)?src.keys:[]).forEach(k=>{if(k&&plFinite(k.t))m=Math.max(m,+k.t);});return m;}
   function plHasTangents(data){let yes=false;
     const scan=t=>(t&&Array.isArray(t.keys)?t.keys:[]).forEach(k=>{if(k&&(k.tan||k.posTan||k.rotTan||k.sclTan))yes=true;});
-    ['bones','bakedBones','expressions','muscles','morphs'].forEach(n=>(data[n]||[]).forEach(scan));scan(data.body);return yes;}
+    ['bones','bakedBones','expressions','muscles','morphs'].forEach(n=>(data[n]||[]).forEach(scan));scan(data.body);scan(data.lookAt);return yes;}
   function plAddTrack(dst,src,type,role,fps,len,clipName){if(!src||typeof src!=='object')return null;
     const id=String(src.id||src.name||role||'Track');
     const t=dst.addTrack({name:id,type,color:pickCol(),uname:(role==='bakedBones'&&src.targetKind==='humanoid')?id:null,
@@ -1802,27 +1805,41 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
         if(s)plPut(c,'scl',f,s,Array.isArray(k.sclTan)?k.sclTan:null,k.t);
       }else if(plFinite(k.v))plPut(c,'w',f,+k.v,k.tan&&typeof k.tan==='object'?k.tan:null,k.t);
     });c._sort();return t;}
-  function importPolyLing(data,fileName){
+  function importPolyLing(data,fileName,label){
     if(!data||data.format!=='PolyLingMotion')throw new Error('format が PolyLingMotion ではありません');
-    const ver=+data.version||1;if(ver!==1&&ver!==2)throw new Error('未対応のversion: '+data.version);
+    const ver=+data.version||1;if(ver!==1&&ver!==2&&ver!==3&&ver!==4)throw new Error('未対応のversion: '+data.version);
+    const oldRoot=(Array.isArray(data.muscles)?data.muscles:[]).find(t=>t&&/^Root[TQ]\./.test(String(t.name||'')));
+    if(oldRoot)throw new Error(`muscles に ${oldRoot.name} があります（腰は body トラックに入れる形式に変わりました。PolyLing の convertMotionRootToBody で変換してください）`);
+    if(data.body&&(String(data.body.id||'')!=='body'||data.body.targetKind!=='body'))
+      throw new Error('body トラックの id と targetKind は "body" でなければなりません');
+    const notes=[];
+    let baked=Array.isArray(data.bakedBones)?data.bakedBones:[];
+    if(ver<4&&baked.length){notes.push(`v${ver} の bakedBones ${baked.length} 本は元モデルのレスト基準なので読みません`);baked=[];}
+    if(Array.isArray(data.sourceRest)&&data.sourceRest.length)notes.push('sourceRest は使わないので読みません');
+    const look=ver>=4&&data.lookAt&&typeof data.lookAt==='object'?data.lookAt:null;
     const fps=plFinite(data.frameRate)&&+data.frameRate>0?+data.frameRate:30;
     const expressions=Array.isArray(data.expressions)?data.expressions:(ver===1&&Array.isArray(data.morphs)?data.morphs:[]);
-    const arrays=[data.bones,data.bakedBones,expressions,data.muscles].filter(Array.isArray);let maxT=plFinite(data.duration)?Math.max(0,+data.duration):0;
-    arrays.forEach(a=>a.forEach(t=>maxT=Math.max(maxT,plTrackMaxTime(t))));maxT=Math.max(maxT,plTrackMaxTime(data.body));
+    const arrays=[data.bones,baked,expressions,data.muscles].filter(Array.isArray);let maxT=plFinite(data.duration)?Math.max(0,+data.duration):0;
+    arrays.forEach(a=>a.forEach(t=>maxT=Math.max(maxT,plTrackMaxTime(t))));maxT=Math.max(maxT,plTrackMaxTime(data.body),plTrackMaxTime(look));
     // 秒→フレームの切り上げは float の誤差（34.0000032 など）で 1 フレーム伸びないよう、わずかな余裕を引く
     const len=Math.max(1,Math.ceil(maxT*fps-1e-4)+1),nm=String(data.name||fileName||'PolyLingMotion');
-    const dst=new MotionTimeline({fps,plMotion:{format:'PolyLingMotion',version:2,name:nm,space:data.space||'local',loop:!!data.loop,
-      duration:maxT,sourceRest:plClone(Array.isArray(data.sourceRest)?data.sourceRest:[]),metadata:plClone(data.metadata||null)}});
+    const ofs=plVec(data.lookAtOffsetFromHeadBone,3);
+    const dst=new MotionTimeline({fps,plMotion:{format:'PolyLingMotion',version:4,name:nm,space:data.space||'local',loop:!!data.loop,
+      duration:maxT,metadata:plClone(data.metadata||null),
+      absentMuscles:data.absentMuscles==='zero'||data.absentMuscles==='rest'?data.absentMuscles:null,
+      lookAtOffsetFromHeadBone:ofs}});
     (Array.isArray(data.bones)?data.bones:[]).forEach(x=>plAddTrack(dst,x,'bone','bones',fps,len,nm));
     if(data.body)plAddTrack(dst,data.body,'bone','body',fps,len,nm);
-    (Array.isArray(data.bakedBones)?data.bakedBones:[]).forEach(x=>plAddTrack(dst,x,'bone','bakedBones',fps,len,nm));
+    if(look)plAddTrack(dst,Object.assign({},look,{id:'lookAt',targetKind:'lookAt'}),'bone','lookAt',fps,len,nm);
+    baked.forEach(x=>plAddTrack(dst,x,'bone','bakedBones',fps,len,nm));
     expressions.forEach(x=>plAddTrack(dst,x,'morph','expressions',fps,len,nm));
     (Array.isArray(data.muscles)?data.muscles:[]).forEach(x=>plAddTrack(dst,x,'muscle','muscles',fps,len,nm));
-    tl=dst;window.tl=tl;motionSpace=data.space||'local';_retargetBackup=null;_poseResetNext=true;
+    tl=dst;window.tl=tl;motionSpace=data.space||'local';_retargetBackup=null;_poseResetNext=true;_warnedNoBaked=false;
+    tl.plMotion.bakedSig=plBakedSig();   // 保存時に「bakedBones を変えたか」を見るための控え
     sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;playhead=0;scrollY=0;view.start=0;refresh();notifyFrame();emitState();sendPose();
     const n=tl.tracks.length,tan=plHasTangents(data);
     window.tlUndo.clearHistory();   // ファイル読込。履歴を消す
-    toast(`PolyLing v${ver} 読込: ${n}トラック / ${fps}fps${tan?'（接線は保持・再生は線形）':''}`);return n;
+    toast(`${label||'PolyLing v'+ver} 読込: ${n}トラック / ${fps}fps${tan?'（接線は保持・再生は線形）':''}${notes.length?' / '+notes.join(' / '):''}`);return n;
   }
   function plKeyMap(t,fps){const map=new Map();
     [...t.clips].sort((a,b)=>a.start-b.start).forEach(c=>t.channels.forEach(ch=>(c.keys[ch.name]||[]).forEach(k=>{
@@ -1845,25 +1862,43 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
       k.rot=k.rot.map(v=>-v);if(Array.isArray(k.rotTan))k.rotTan=k.rotTan.map(plNegTan);}prev=k.rot;});
     return{id:String((targetKind==='humanoid'&&t.uname)||t.name||t.id),targetKind,
       preWrapMode:plWrap(t.preWrapMode),postWrapMode:plWrap(t.postWrapMode,t.clips.some(c=>c.loop)?'Loop':'Clamp'),keys};}
+  // bakedBones（ボーン型で骨のトラック）の中身の控え。読込時と保存時で比べる
+  function plBakedSig(){const fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30;
+    return JSON.stringify(tl.tracks.filter(t=>t.type==='bone'&&!isAuxTrack(t)&&(t.plRole==='bakedBones'||(!t.plRole&&t.uname)))
+      .map(t=>plMakeTrack(t,fps,'humanoid')).sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0));}
+  let plLastDropped=false;   // 直前の exportPolyLing で muscles と body を書かなかったか
   function exportPolyLing(){const meta=tl.plMotion||{},fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30;
-    const out={format:'PolyLingMotion',version:2,name:String(meta.name||'Motion'),frameRate:fps,duration:0,
+    const out={format:'PolyLingMotion',version:4,name:String(meta.name||'Motion'),frameRate:fps,duration:0,
       space:meta.space||'local',loop:!!meta.loop,bones:[],expressions:[],muscles:[],body:null,bakedBones:[],
-      sourceRest:plClone(Array.isArray(meta.sourceRest)?meta.sourceRest:[]),metadata:plClone(meta.metadata||{createdWith:'Motion Studio'})};
+      metadata:plClone(meta.metadata||{createdWith:'Motion Studio'})};
+    if(meta.absentMuscles==='zero'||meta.absentMuscles==='rest')out.absentMuscles=meta.absentMuscles;
     let maxF=0;tl.tracks.forEach(t=>t.clips.forEach(c=>maxF=Math.max(maxF,c.start+Math.max(0,c.len-1))));
     tl.tracks.forEach(t=>{let role=t.plRole;if(!role)role=t.type==='morph'?'expressions':t.type==='muscle'?'muscles':t.uname?'bakedBones':'bones';
       if(t.type==='morph'||role==='expressions'){const d=plMakeTrack(t,fps,'scalar');delete d.id;delete d.targetKind;d.name=String(t.name||t.id);
         if(t.plCategory)d.category=t.plCategory;if(t.plProvider)d.provider=t.plProvider;out.expressions.push(d);return;}
       if(t.type==='muscle'||role==='muscles'){const d=plMakeTrack(t,fps,'scalar');delete d.id;delete d.targetKind;d.name=String(t.name||t.id);out.muscles.push(d);return;}
+      if(role==='body'){if(out.body)return;const d=plMakeTrack(t,fps,'body');d.id='body';out.body=d;return;}   // 腰（RootT / RootQ）
+      if(role==='lookAt'){if(out.lookAt)return;const d=plMakeTrack(t,fps,'lookAt');d.id='lookAt';   // 視線は回転だけ
+        d.keys=d.keys.filter(k=>{delete k.pos;delete k.posTan;delete k.scl;delete k.sclTan;return !!k.rot;});out.lookAt=d;return;}
       const allowed=new Set(['boneName','path','humanoid']);let kind=t.plTargetKind||(role==='bakedBones'?'humanoid':'boneName');if(!allowed.has(kind))kind='boneName';
       if(role==='bones'&&kind==='humanoid')kind='boneName';const d=plMakeTrack(t,fps,kind);
-      if(role==='body'&&!out.body)out.body=d;else if(role==='bakedBones'||kind==='humanoid')out.bakedBones.push(d);else out.bones.push(d);
+      if(role==='bakedBones'||kind==='humanoid'){   // 正準骨格は骨の長さを持たないので、Hips の pos と回転だけ書く
+        d.keys=d.keys.filter(k=>{delete k.scl;delete k.sclTan;if(d.id!=='Hips'){delete k.pos;delete k.posTan;}return !!(k.rot||k.pos);});
+        if(d.keys.length)out.bakedBones.push(d);}
+      else out.bones.push(d);
     });
+    const ofs=plVec(meta.lookAtOffsetFromHeadBone,3);if(ofs)out.lookAtOffsetFromHeadBone=ofs;
+    // muscles と bakedBones が食い違うときは muscles と body を書かない（PolyLing が bakedBones から焼き直す）
+    plLastDropped=false;
+    if((out.muscles.length||out.body)&&out.bakedBones.length&&meta.bakedSig!=null&&plBakedSig()!==meta.bakedSig){out.muscles=[];out.body=null;plLastDropped=true;}
     // 長さが読み込んだときのまま（フレームに直して同じ）なら、元の秒をそのまま書く
     const d0=meta.duration;out.duration=(plFinite(d0)&&Math.round(+d0*fps)===maxF)?+d0:+(maxF/fps).toFixed(7);return out;}
+  function plSaveToast(data){toast(`PolyLing v4 保存: ${data.bones.length+data.bakedBones.length}ボーン / ${data.expressions.length}表情 / ${data.muscles.length}マッスル`
+    +(plLastDropped?'（bakedBones を変えたのでマッスルと body は書かず。PolyLing が読むときに bakedBones から作り直します）':''));}
   function downloadPolyLing(){const data=exportPolyLing(),safe=(data.name||'motion').replace(/[\\/:*?"<>|]+/g,'_');
     const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json;charset=utf-8'}),a=document.createElement('a');
     a.href=URL.createObjectURL(blob);a.download=safe+'.plmotion.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
-    toast(`PolyLing v2 保存: ${data.bones.length+data.bakedBones.length+(data.body?1:0)}ボーン / ${data.expressions.length}表情`);}
+    plSaveToast(data);}
   const plLoadBtn=document.getElementById('plLoadBtn'),plFile=document.getElementById('plFile'),plSaveBtn=document.getElementById('plSaveBtn');
   if(plLoadBtn)plLoadBtn.onclick=()=>plFile.click();if(plSaveBtn)plSaveBtn.onclick=downloadPolyLing;
   if(plFile)plFile.onchange=function(){const f=this.files&&this.files[0];if(!f)return;const rd=new FileReader();rd.onload=()=>{try{
@@ -1872,192 +1907,22 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
   window.MotionStudioPolyLing={import:importPolyLing,export:exportPolyLing,download:downloadPolyLing};
   /* ===== VRMA (VRMC_vrm_animation 1.0) 読み書き =====
      外側の「VRMA読込」「VRMA保存」から使う（command 'vrmaLoadData' / 'vrmaSave'）。
-     書き出しのレスト骨格は下の DEFAULT_SKEL（ボーン編集の内蔵 T ポーズと同じ値）。
-     タイムラインの値の意味はボーン編集ペインの pose と同じ：
-       回転 = 恒等レスト（ワールド軸にそろえたレスト）上のローカル回転、Unity 左手系 [x,y,z,w]
-       Hips 位置 = レスト位置からの差分、Unity 左手系
-     glTF(VRM1) ⇔ Unity は X 反転：回転 (x,y,z,w)⇔(x,-y,-z,w)、位置 (x,y,z)⇔(-x,y,z)。
-     読込の回転変換は @pixiv/three-vrm-animation と同じ（親 Humanoid ボーンのレストワールド回転·q·自分のレストワールド回転^-1）。 */
-  const VRM_PARENT={hips:null,spine:'hips',chest:'spine',upperChest:'chest',neck:'upperChest',head:'neck',leftEye:'head',rightEye:'head',jaw:'head',
-    leftUpperLeg:'hips',leftLowerLeg:'leftUpperLeg',leftFoot:'leftLowerLeg',leftToes:'leftFoot',
-    rightUpperLeg:'hips',rightLowerLeg:'rightUpperLeg',rightFoot:'rightLowerLeg',rightToes:'rightFoot',
-    leftShoulder:'upperChest',leftUpperArm:'leftShoulder',leftLowerArm:'leftUpperArm',leftHand:'leftLowerArm',
-    rightShoulder:'upperChest',rightUpperArm:'rightShoulder',rightLowerArm:'rightUpperArm',rightHand:'rightLowerArm'};
-  ['left','right'].forEach(s=>{VRM_PARENT[s+'ThumbMetacarpal']=s+'Hand';VRM_PARENT[s+'ThumbProximal']=s+'ThumbMetacarpal';VRM_PARENT[s+'ThumbDistal']=s+'ThumbProximal';
-    ['Index','Middle','Ring','Little'].forEach(g=>{VRM_PARENT[s+g+'Proximal']=s+'Hand';VRM_PARENT[s+g+'Intermediate']=s+g+'Proximal';VRM_PARENT[s+g+'Distal']=s+g+'Intermediate';});});
-  const VRM_EXPR_PRESET=new Set(['happy','angry','sad','relaxed','surprised','aa','ih','ou','ee','oh','blink','blinkLeft','blinkRight','lookUp','lookDown','lookLeft','lookRight','neutral']);
-  // Unity HumanBodyBones 名 ⇔ VRM1 humanBones 名（親指だけ段の名前がずれる）
-  const U2V_THUMB={Proximal:'Metacarpal',Intermediate:'Proximal',Distal:'Distal'},V2U_THUMB={Metacarpal:'Proximal',Proximal:'Intermediate',Distal:'Distal'};
-  function u2v(n){n=String(n||'');const m=/^(Left|Right)Thumb(Proximal|Intermediate|Distal)$/.exec(n);
-    if(m)return m[1].toLowerCase()+'Thumb'+U2V_THUMB[m[2]];return n?n[0].toLowerCase()+n.slice(1):n;}
-  function v2u(n){const m=/^(left|right)Thumb(Metacarpal|Proximal|Distal)$/.exec(n);
-    if(m)return (m[1]==='left'?'Left':'Right')+'Thumb'+V2U_THUMB[m[2]];return n[0].toUpperCase()+n.slice(1);}
-  // VRM 未読込時のレスト骨格（ボーン編集ペイン内蔵の T ポーズと同じ値。Unity 左手系・+Z 正面）
-  const DEFAULT_SKEL=(()=>{const T=[['Hips',null,[0,1.00,0]],['Spine','Hips',[0,0.12,0]],['Chest','Spine',[0,0.13,0]],['UpperChest','Chest',[0,0.13,0]],
-    ['Neck','UpperChest',[0,0.12,0]],['Head','Neck',[0,0.10,0]],['LeftShoulder','UpperChest',[-0.06,0.10,0]],['LeftUpperArm','LeftShoulder',[-0.12,0,0]],
-    ['LeftLowerArm','LeftUpperArm',[-0.27,0,0]],['LeftHand','LeftLowerArm',[-0.24,0,0]],['RightShoulder','UpperChest',[0.06,0.10,0]],
-    ['RightUpperArm','RightShoulder',[0.12,0,0]],['RightLowerArm','RightUpperArm',[0.27,0,0]],['RightHand','RightLowerArm',[0.24,0,0]],
-    ['LeftUpperLeg','Hips',[-0.09,-0.06,0]],['LeftLowerLeg','LeftUpperLeg',[0,-0.40,0]],['LeftFoot','LeftLowerLeg',[0,-0.40,0.02]],['LeftToes','LeftFoot',[0,-0.04,0.12]],
-    ['RightUpperLeg','Hips',[0.09,-0.06,0]],['RightLowerLeg','RightUpperLeg',[0,-0.40,0]],['RightFoot','RightLowerLeg',[0,-0.40,0.02]],['RightToes','RightFoot',[0,-0.04,0.12]]];
-    const P={},bones=[];T.forEach(([n,par,o])=>{const pp=par?P[par]:[0,0,0];P[n]=[pp[0]+o[0],pp[1]+o[1],pp[2]+o[2]];bones.push({name:n,parent:par,pos:P[n],humanoid:n});});
-    return{type:'skeleton',space:'unity',source:'default',bones};})();
-
-  // ---- 4x4（glTF と同じ列優先）とクォータニオン [x,y,z,w] ----
-  function m4Compose(t,q,s){const[x,y,z,w]=q,x2=x+x,y2=y+y,z2=z+z,xx=x*x2,xy=x*y2,xz=x*z2,yy=y*y2,yz=y*z2,zz=z*z2,wx=w*x2,wy=w*y2,wz=w*z2;
-    return[(1-(yy+zz))*s[0],(xy+wz)*s[0],(xz-wy)*s[0],0,(xy-wz)*s[1],(1-(xx+zz))*s[1],(yz+wx)*s[1],0,(xz+wy)*s[2],(yz-wx)*s[2],(1-(xx+yy))*s[2],0,t[0],t[1],t[2],1];}
-  function m4Mul(a,b){const r=new Array(16);for(let c=0;c<4;c++)for(let rr=0;rr<4;rr++){let v=0;for(let k=0;k<4;k++)v+=a[k*4+rr]*b[c*4+k];r[c*4+rr]=v;}return r;}
-  function m4Point(m,p){return[m[0]*p[0]+m[4]*p[1]+m[8]*p[2]+m[12],m[1]*p[0]+m[5]*p[1]+m[9]*p[2]+m[13],m[2]*p[0]+m[6]*p[1]+m[10]*p[2]+m[14]];}
-  function m4Rot(m){   // 列を正規化した回転部 → クォータニオン
-    const c=[0,1,2].map(i=>{const v=[m[i*4],m[i*4+1],m[i*4+2]],l=Math.hypot(v[0],v[1],v[2])||1;return[v[0]/l,v[1]/l,v[2]/l];});
-    const m00=c[0][0],m10=c[0][1],m20=c[0][2],m01=c[1][0],m11=c[1][1],m21=c[1][2],m02=c[2][0],m12=c[2][1],m22=c[2][2],tr=m00+m11+m22;let q;
-    if(tr>0){const s=0.5/Math.sqrt(tr+1);q=[(m21-m12)*s,(m02-m20)*s,(m10-m01)*s,0.25/s];}
-    else if(m00>m11&&m00>m22){const s=2*Math.sqrt(1+m00-m11-m22);q=[0.25*s,(m01+m10)/s,(m02+m20)/s,(m21-m12)/s];}
-    else if(m11>m22){const s=2*Math.sqrt(1+m11-m00-m22);q=[(m01+m10)/s,0.25*s,(m12+m21)/s,(m02-m20)/s];}
-    else{const s=2*Math.sqrt(1+m22-m00-m11);q=[(m02+m20)/s,(m12+m21)/s,0.25*s,(m10-m01)/s];}
-    return Q.norm(q);}
-  const qInv=q=>[-q[0],-q[1],-q[2],q[3]];
-  const u2gQ=q=>[q[0],-q[1],-q[2],q[3]], u2gV=v=>[-v[0],v[1],v[2]];   // Unity ⇔ glTF（X 反転、自己逆）
-
-  // ---- GLB 読み ----
-  function glbParse(buf){const dv=new DataView(buf);
-    if(buf.byteLength<20||dv.getUint32(0,true)!==0x46546C67)throw new Error('GLB ではありません');
-    let off=12,json=null,bin=null;
-    while(off+8<=buf.byteLength){const len=dv.getUint32(off,true),type=dv.getUint32(off+4,true),body=buf.slice(off+8,off+8+len);
-      if(type===0x4E4F534A)json=JSON.parse(new TextDecoder().decode(body));else if(type===0x004E4942)bin=body;off+=8+len;}
-    if(!json)throw new Error('JSON チャンクがありません');return{g:json,bin};}
-  function accRead(g,bin,i){const a=g.accessors[i];if(!a)throw new Error('accessor '+i+' がありません');
-    if(a.sparse)throw new Error('sparse accessor は未対応');
-    const n={SCALAR:1,VEC2:2,VEC3:3,VEC4:4,MAT4:16}[a.type],out=new Float32Array(a.count*n);if(a.bufferView==null)return out;
-    const bv=g.bufferViews[a.bufferView];if((bv.buffer||0)!==0||!bin)throw new Error('外部バッファは未対応');
-    const cs={5126:4,5120:1,5121:1,5122:2,5123:2,5125:4}[a.componentType],stride=bv.byteStride||cs*n,base=(bv.byteOffset||0)+(a.byteOffset||0),dv=new DataView(bin);
-    for(let e=0;e<a.count;e++)for(let c=0;c<n;c++){const p=base+e*stride+c*cs;let v;
-      switch(a.componentType){case 5126:v=dv.getFloat32(p,true);break;
-        case 5120:v=dv.getInt8(p);if(a.normalized)v=Math.max(v/127,-1);break;case 5121:v=dv.getUint8(p);if(a.normalized)v/=255;break;
-        case 5122:v=dv.getInt16(p,true);if(a.normalized)v=Math.max(v/32767,-1);break;case 5123:v=dv.getUint16(p,true);if(a.normalized)v/=65535;break;
-        default:v=dv.getUint32(p,true);}
-      out[e*n+c]=v;}
-    return out;}
-  // サンプラ → [{t, v[]}]。CUBICSPLINE は [in, value, out] の value だけを使う
-  function samplerKeys(g,bin,smp,n){const T=accRead(g,bin,smp.input),V=accRead(g,bin,smp.output),cub=smp.interpolation==='CUBICSPLINE',ks=[];
-    for(let i=0;i<T.length;i++){const o=cub?(i*3+1)*n:i*n;ks.push({t:T[i],v:Array.from(V.slice(o,o+n))});}return ks;}
-
+     変換は plmotion_vrma.js（PLVrma。規則の正本は PolyLing の VrmaCodec）。
+     読込：.vrma → bakedBones・表情・lookAt の PolyLing モーション（v4）→ importPolyLing。
+     保存：exportPolyLing の結果 → .vrma。骨は bakedBones だけから作る（無ければ書き出せない）。 */
   function importVrma(buf,fileName){
-    const{g,bin}=glbParse(buf),ext=g.extensions&&g.extensions.VRMC_vrm_animation;
-    if(!ext)throw new Error('VRMC_vrm_animation 拡張がありません');
-    const anim=(g.animations||[])[0];if(!anim)throw new Error('アニメーションがありません');
-    const nodes=g.nodes||[],parentOf=new Array(nodes.length).fill(-1);
-    nodes.forEach((nd,i)=>(nd.children||[]).forEach(c=>parentOf[c]=i));
-    const world=new Array(nodes.length);
-    const worldOf=i=>{if(world[i])return world[i];const nd=nodes[i];
-      const L=Array.isArray(nd.matrix)&&nd.matrix.length===16?nd.matrix.slice():m4Compose(nd.translation||[0,0,0],nd.rotation||[0,0,0,1],nd.scale||[1,1,1]);
-      return world[i]=parentOf[i]>=0?m4Mul(worldOf(parentOf[i]),L):L;};
-    const hb=(ext.humanoid&&ext.humanoid.humanBones)||{},boneOfNode=new Map(),nodeOfBone={};
-    for(const nm in hb){const nd=hb[nm]&&hb[nm].node;if(Number.isInteger(nd)){boneOfNode.set(nd,nm);nodeOfBone[nm]=nd;}}
-    const exprOfNode=new Map(),ex=ext.expressions||{};
-    ['preset','custom'].forEach(k=>{const o=ex[k]||{};for(const nm in o){const nd=o[nm]&&o[nm].node;if(Number.isInteger(nd))exprOfNode.set(nd,{name:nm,kind:k});}});
-    if(!('hips' in nodeOfBone))throw new Error('hips がありません');
-    const hipsW=worldOf(nodeOfBone.hips),restHips=m4Point(hipsW,[0,0,0]);
-    const hipsParentW=parentOf[nodeOfBone.hips]>=0?worldOf(parentOf[nodeOfBone.hips]):m4Compose([0,0,0],[0,0,0,1],[1,1,1]);
-    const rotW=nm=>m4Rot(worldOf(nodeOfBone[nm]));
-    const fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30,nm=String(fileName||'VRMA');
-    const items=[];let maxT=0,skipped=0;
-    (anim.channels||[]).forEach(ch=>{const tg=ch.target||{},smp=(anim.samplers||[])[ch.sampler];if(!smp||!Number.isInteger(tg.node))return;
-      const bone=boneOfNode.get(tg.node);
-      if(bone){
-        if(tg.path==='rotation'){let par=VRM_PARENT[bone];while(par&&!(par in nodeOfBone))par=VRM_PARENT[par];
-          const qp=par?rotW(par):m4Rot(hipsParentW),qi=qInv(rotW(bone));
-          const ks=samplerKeys(g,bin,smp,4).map(k=>({t:k.t,v:u2gQ(Q.norm(Q.mul(Q.mul(qp,Q.norm(k.v)),qi)))}));
-          items.push({kind:'rot',name:v2u(bone),keys:ks});ks.forEach(k=>maxT=Math.max(maxT,k.t));}
-        else if(tg.path==='translation'&&bone==='hips'){
-          const ks=samplerKeys(g,bin,smp,3).map(k=>{const w=m4Point(hipsParentW,k.v);return{t:k.t,v:u2gV([w[0]-restHips[0],w[1]-restHips[1],w[2]-restHips[2]])};});
-          items.push({kind:'pos',name:'Hips',keys:ks});ks.forEach(k=>maxT=Math.max(maxT,k.t));}
-        else skipped++;
-        return;}
-      const e=exprOfNode.get(tg.node);
-      if(e&&tg.path==='translation'){const ks=samplerKeys(g,bin,smp,3).map(k=>({t:k.t,v:k.v[0]}));
-        items.push({kind:'w',name:e.name,keys:ks});ks.forEach(k=>maxT=Math.max(maxT,k.t));return;}
-      skipped++;});   // lookAt など
-    const len=Math.max(1,Math.ceil(maxT*fps-1e-4)+1);
-    const dst=new MotionTimeline({fps,plMotion:{format:'PolyLingMotion',version:2,name:nm,space:'local',loop:false,duration:maxT,sourceRest:[],metadata:null}});
-    const bonesT={},morphT={};
-    items.forEach(it=>{let t,c;
-      if(it.kind==='w'){t=morphT[it.name];if(!t){t=morphT[it.name]=dst.addTrack({name:it.name,type:'morph',color:pickCol(),plProvider:'vrm1'});t.addClip({name:nm,start:0,len});}}
-      else{t=bonesT[it.name];if(!t){t=bonesT[it.name]=dst.addTrack({name:it.name,uname:it.name,type:'bone',color:pickCol()});t.addClip({name:nm,start:0,len});}}
-      c=t.clips[0];it.keys.forEach(k=>plPut(c,it.kind,Math.max(0,Math.round(k.t*fps)),it.kind==='w'?+k.v:k.v,null,k.t));c._sort();});
-    tl=dst;window.tl=tl;motionSpace='local';_retargetBackup=null;_poseResetNext=true;
-    sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;playhead=0;scrollY=0;view.start=0;refresh();notifyFrame();emitState();sendPose();
-    window.tlUndo.clearHistory();   // ファイル読込。履歴を消す
-    toast(`VRMA 読込: ${dst.tracks.length}トラック / ${fps}fps${skipped?`（未対応チャンネル ${skipped} 件を無視）`:''}`);return dst.tracks.length;}
-
-  // ---- VRMA 書出（Hips 平行移動・Humanoid 回転・表情）----
-  function exportVrma(){
-    const fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30;
-    let maxF=0;tl.tracks.forEach(t=>t.clips.forEach(c=>maxF=Math.max(maxF,c.start+Math.max(0,c.len-1))));
-    const skel=DEFAULT_SKEL,posU={};
-    skel.bones.forEach(b=>{const v=u2v(b.humanoid||b.name);if(v in VRM_PARENT&&Array.isArray(b.pos))posU[v]=b.pos;});
-    if(!posU.hips)throw new Error('骨格に Hips がありません');
-    const order=Object.keys(VRM_PARENT).filter(v=>posU[v]),nodes=[],nodeOf={};
-    order.forEach(v=>{let par=VRM_PARENT[v];while(par&&!posU[par])par=VRM_PARENT[par];
-      const p=posU[v],pp=par?posU[par]:[0,0,0];nodeOf[v]=nodes.length;
-      nodes.push({name:v2u(v),translation:u2gV([p[0]-pp[0],p[1]-pp[1],p[2]-pp[2]]),_par:par});});
-    nodes.forEach((n,i)=>{if(n._par){const pn=nodes[nodeOf[n._par]];(pn.children=pn.children||[]).push(i);}});
-    const roots=nodes.map((n,i)=>n._par?-1:i).filter(i=>i>=0);nodes.forEach(n=>delete n._par);
-    const bytes=[];let blen=0;const views=[],accs=[];
-    function addAcc(arr,type,minmax){while(blen%4){bytes.push(new Uint8Array(1));blen++;}
-      const f=new Float32Array(arr),b=new Uint8Array(f.buffer);views.push({buffer:0,byteOffset:blen,byteLength:b.length});bytes.push(b);blen+=b.length;
-      const a={bufferView:views.length-1,componentType:5126,count:arr.length/{SCALAR:1,VEC3:3,VEC4:4}[type],type};
-      if(minmax){a.min=[Math.min(...arr)];a.max=[Math.max(...arr)];}accs.push(a);return accs.length-1;}
-    const frames=[];for(let f=0;f<=maxF;f++)frames.push(f);
-    const tAcc=addAcc(frames.map(f=>f/fps),'SCALAR',true);
-    const channels=[],samplers=[],used=new Set();
-    const addCh=(node,path,out,type)=>{samplers.push({input:tAcc,output:addAcc(out,type),interpolation:'LINEAR'});channels.push({sampler:samplers.length-1,target:{node,path}});};
-    tl.tracks.forEach(t=>{if(t.type!=='bone'||!t.clips.length)return;
-      const v=u2v(poseNameToCanon(canon(t)));if(!(v in nodeOf)||used.has(v))return;used.add(v);
-      const hasRot=t.clips.some(c=>(c.keys.rot||[]).length),hasPos=v==='hips'&&t.clips.some(c=>(c.keys.pos||[]).length);
-      if(hasRot){const out=[];let prev=null;frames.forEach(f=>{let q=u2gQ(Q.norm(t.sample(f).rot||[0,0,0,1]));
-          if(prev&&prev[0]*q[0]+prev[1]*q[1]+prev[2]*q[2]+prev[3]*q[3]<0)q=q.map(x=>-x);prev=q;out.push(...q);});
-        addCh(nodeOf[v],'rotation',out,'VEC4');}
-      if(hasPos){const rh=nodes[nodeOf.hips].translation,out=[];frames.forEach(f=>{const d=u2gV(t.sample(f).pos||[0,0,0]);out.push(rh[0]+d[0],rh[1]+d[1],rh[2]+d[2]);});
-        addCh(nodeOf.hips,'translation',out,'VEC3');}});
-    // マッスルだけで動く骨（Humanoid クリップ）も書く。ボーントラックのある骨はそちらを使う（used 済み）。
-    // 変換は muscle_pose.js。腰の位置は RootT × (レストの腰の高さ / 先頭フレームの RootT.y)。
-    const mTracks=tl.tracks.filter(t=>t.type==='muscle'&&t.clips.length);
-    if(mTracks.length&&window.MusclePose){
-      const mv=f=>{const o={};mTracks.forEach(t=>{const p=t.sample(f);if(p&&Number.isFinite(+p.w))o[t.name]=+p.w;});return o;};
-      const v0=mv(0),y0=v0['RootT.y'],hipsRest=posU.hips;
-      const poses=frames.map(f=>window.MusclePose.musclesToBones(mv(f)));
-      order.forEach(v=>{if(used.has(v))return;const u=v2u(v);if(!poses.some(o=>o[u]))return;used.add(v);
-        const out=[];let prev=null;poses.forEach(o=>{let q=u2gQ(Q.norm((o[u]&&o[u].rot)||[0,0,0,1]));
-          if(prev&&prev[0]*q[0]+prev[1]*q[1]+prev[2]*q[2]+prev[3]*q[3]<0)q=q.map(x=>-x);prev=q;out.push(...q);});
-        addCh(nodeOf[v],'rotation',out,'VEC4');
-        if(v==='hips'&&Number.isFinite(y0)&&Math.abs(y0)>1e-4&&poses.some(o=>o.Hips&&o.Hips.rootT)){
-          const s=hipsRest[1]/y0,tr=[];
-          poses.forEach(o=>{const t=(o.Hips&&o.Hips.rootT)||[0,y0,0];tr.push(...u2gV([t[0]*s,t[1]*s,t[2]*s]));});
-          addCh(nodeOf.hips,'translation',tr,'VEC3');}});
-    }
-    const exprExt={preset:{},custom:{}};let nExpr=0;
-    tl.tracks.forEach(t=>{if(t.type!=='morph'||!t.clips.some(c=>(c.keys.w||[]).length))return;const nm=String(t.name);
-      const kind=VRM_EXPR_PRESET.has(nm)?'preset':'custom';if(exprExt[kind][nm])return;
-      const ni=nodes.length;nodes.push({name:'Expression_'+nm});roots.push(ni);exprExt[kind][nm]={node:ni};nExpr++;
-      const out=[];frames.forEach(f=>{const w=+t.sample(f).w;out.push(Number.isFinite(w)?w:0,0,0);});addCh(ni,'translation',out,'VEC3');});
-    const humanBones={};order.forEach(v=>humanBones[v]={node:nodeOf[v]});
-    const ext={specVersion:'1.0',humanoid:{humanBones}};if(nExpr){ext.expressions={};if(Object.keys(exprExt.preset).length)ext.expressions.preset=exprExt.preset;if(Object.keys(exprExt.custom).length)ext.expressions.custom=exprExt.custom;}
-    const meta=tl.plMotion||{},name=String(meta.name||'Motion');
-    const g={asset:{version:'2.0',generator:'Motion Studio'},extensionsUsed:['VRMC_vrm_animation'],extensions:{VRMC_vrm_animation:ext},
-      scene:0,scenes:[{nodes:roots}],nodes,animations:[{name,channels,samplers}],accessors:accs,bufferViews:views,buffers:[{byteLength:0}]};
-    while(blen%4){bytes.push(new Uint8Array(1));blen++;}g.buffers[0].byteLength=blen;
-    let js=new TextEncoder().encode(JSON.stringify(g));const jpad=(4-js.length%4)%4;
-    if(jpad){const j2=new Uint8Array(js.length+jpad);j2.set(js);j2.fill(0x20,js.length);js=j2;}
-    const total=12+8+js.length+8+blen,out=new Uint8Array(total),dv=new DataView(out.buffer);
-    dv.setUint32(0,0x46546C67,true);dv.setUint32(4,2,true);dv.setUint32(8,total,true);
-    dv.setUint32(12,js.length,true);dv.setUint32(16,0x4E4F534A,true);out.set(js,20);
-    let o=20+js.length;dv.setUint32(o,blen,true);dv.setUint32(o+4,0x004E4942,true);o+=8;bytes.forEach(b=>{out.set(b,o);o+=b.length;});
-    return{name,glb:out,nBones:channels.length-nExpr,nExpr,frames:frames.length};}
+    const r=window.PLVrma.decode(buf,fileName);
+    const errs=r.issues.filter(i=>i.error),warns=r.issues.filter(i=>!i.error);
+    if(!r.dto)throw new Error(errs.map(i=>i.message).join(' / ')||'読めません');
+    const n=importPolyLing(r.dto,fileName,'VRMA');
+    if(warns.length)toast(`VRMA 読込: ${n}トラック / 警告 ${warns.length} 件：${warns.map(i=>i.message).join(' / ')}`);
+    return n;}
+  function exportVrma(){const fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30;return window.PLVrma.encode(exportPolyLing(),{fps});}
   // 保存は外側が行う（このファイルは別ファイルとして読み込まれ、ここからは保存ダイアログを開けないため）。
   function sendVrmaFile(){let r;try{r=exportVrma();}catch(e){alert('VRMA保存エラー: '+e.message);return;}
     const buf=r.glb.buffer.slice(r.glb.byteOffset,r.glb.byteOffset+r.glb.byteLength);
     parent.postMessage({app:'MotionStudio',from:'timeline',file:{name:r.name.replace(/[\\/:*?"<>|]+/g,'_')+'.vrma',buffer:buf,mime:'model/gltf-binary'}},'*',[buf]);
-    toast(`VRMA 保存: ${r.nBones}チャンネル / 表情${r.nExpr} / ${r.frames}f`);}
+    toast('VRMA 保存: '+window.PLVrma.reportText(r.report));}
   window.MotionStudioVrma={import:importVrma,export:exportVrma};
   const nativeSend = wsSend;
   wsSend = function(payload){
@@ -2093,7 +1958,7 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
       case 'vrmaSave': sendVrmaFile(); break;
       case 'plSave': {const data=exportPolyLing(),safe=(data.name||'motion').replace(/[\\/:*?"<>|]+/g,'_');
                       parent.postMessage({app:'MotionStudio',from:'timeline',file:{name:safe+'.plmotion.json',text:JSON.stringify(data,null,2)}},'*');
-                      toast(`PolyLing v2 保存: ${data.bones.length+data.bakedBones.length+(data.body?1:0)}ボーン / ${data.expressions.length}表情`);} break;
+                      plSaveToast(data);} break;
       case 'undo': window.tlUndo.undo(); break;
       case 'redo': window.tlUndo.redo(); break;
     }
