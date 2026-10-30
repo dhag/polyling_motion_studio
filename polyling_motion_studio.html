@@ -179,6 +179,7 @@ vrmFile.onchange=()=>{const f=vrmFile.files&&vrmFile.files[0];vrmFile.value='';i
 const LIVE_REST_HIPS_Y=1.0;   // ボーン編集の内蔵骨格の腰の高さ（timeline.html の REST_HIPS_Y と同じ）
 let liveFirst=true;            // 次の姿勢で T ポーズに戻させる（前の姿勢の骨が残らないように）
 let liveNoBones=0;             // bones の無いフレームの数（表示しない）
+let liveLastBones=[];          // 前のフレームで受けた骨の名前
 const liveBtn=document.getElementById('liveBtn');
 const liveQ=v=>Array.isArray(v)&&v.length===4&&v.every(x=>Number.isFinite(+x))?v.map(Number):null;
 const live=PolyLingLive.create({
@@ -189,7 +190,10 @@ const live=PolyLingLive.create({
     for(const n in m.bones){const q=liveQ(m.bones[n]);if(q)bones[n]={rot:q};}
     const h=Array.isArray(m.hips)&&m.hips.length===3&&m.hips.every(x=>Number.isFinite(+x))?m.hips.map(Number):null;
     if(h&&bones.Hips)bones.Hips.pos=h.map(v=>v*LIVE_REST_HIPS_Y);
-    if(liveFirst){msg.reset=true;liveFirst=false;}
+    // 前のフレームにあって今回無い骨（駆動されなくなった骨）は前の回転が残るので、そのときも T ポーズへ戻してから当てる。
+    const names=Object.keys(bones);
+    if(liveFirst||liveLastBones.some(n=>!(n in bones))){msg.reset=true;liveFirst=false;}
+    liveLastBones=names;
     to('bone',{payload:msg});to('vrm',{payload:msg});
   },
 },{
@@ -198,7 +202,7 @@ const live=PolyLingLive.create({
   onLog:t=>{document.getElementById('status').textContent=t;},
 });
 liveBtn.onclick=()=>{if(live.connected){live.disconnect();return;}
-  liveFirst=true;liveNoBones=0;live.connect(document.getElementById('liveUrl').value.trim());};
+  liveFirst=true;liveNoBones=0;liveLastBones=[];live.connect(document.getElementById('liveUrl').value.trim());};
 const help=document.getElementById('help');document.getElementById('helpBtn').onclick=()=>help.classList.add('on');document.getElementById('helpClose').onclick=()=>help.classList.remove('on');help.onclick=e=>{if(e.target===help)help.classList.remove('on')};
 window.addEventListener('keydown',e=>{if(/input|textarea/i.test(e.target.tagName))return;const mod=e.ctrlKey||e.metaKey;if(mod&&e.key.toLowerCase()==='z'){e.preventDefault();cmd(e.shiftKey?'redo':'undo')}else if(mod&&e.key.toLowerCase()==='y'){e.preventDefault();cmd('redo')}else if(e.code==='Space'){e.preventDefault();cmd('play')}else if(e.key==='ArrowLeft')cmd('step',e.shiftKey?-10:-1);else if(e.key==='ArrowRight')cmd('step',e.shiftKey?10:1);else if(e.key==='k'||e.key==='K')cmd('key');else if(e.key==='Delete')cmd('delete')});
 const vsplit=document.getElementById('vsplit'),boneSub=document.getElementById('boneSub');
