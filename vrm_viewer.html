@@ -9,7 +9,12 @@
  外側とのやり取り（一覧は motion_studio.html の先頭）
    送る : {from:'vrm', ready:true}
    受ける: {to:'vrm', command:'loadVrm', buffer:ArrayBuffer, name}   VRM ファイルの中身
-          {to:'vrm', payload:{type:'pose', bones:{名前:{rot, pos?}}}}  姿勢（ボーン編集・タイムラインから中継）
+          {to:'vrm', payload:{type:'pose', bones:{名前:{rot, pos?}}, expressions?:[{name, provider, w}]}}
+                                                                        姿勢と表情（ボーン編集・タイムラインから中継。expressions はタイムラインだけ）
+ 表情: name（トラック名）を VRM の表情名へ引き当てる。規則は VRMA 書き出し（plmotion_vrma.js の encode）と同じ：
+       provider==='vrm1' なら tryGetPreset、それ以外は tryResolvePreset(name, null)。preset に当たらなければ元の名前を custom として使い、
+       preset が既に使われていれば元の名前の custom へ落とす（先勝ち）。視線の preset（lookUp 等）は当てない（lookAt が毎フレーム上書きする）。
+       値は [0,1] に丸めて expressionManager.setValue で当てる。モデルに無い表情は飛ばす。
  姿勢の値の意味（ボーン編集と同じ）
    回転 rot = レスト（T ポーズ・回転なし）からのローカル回転 [x,y,z,w]、Unity 左手系・キャラは +Z 向き・+X がキャラの右。
    位置 pos = Hips だけ使う。レスト位置からの移動量（ボーン編集の内蔵骨格の単位。腰の高さ = 1）。
@@ -18,7 +23,7 @@
    VRM0 は rotateVRM0 で向きをそろえたうえで、@pixiv/three-vrm-animation と同じく x,z をさらに反転する。
  名前: Unity の Humanoid 名（Hips / LeftUpperArm など）だけを当てる。それ以外の名前（PMX の日本語名など）は無視する。
  マッスル: 扱わない。骨は bakedBones（タイムライン）か PolyLing が解いた bones（ライブ受信）で届く。
- reset:true の pose は、全身を T ポーズに戻してから当てる（新しいモーションを読み込んだ直後）。
+ reset:true の pose は、全身を T ポーズに戻し、全部の表情を 0 にしてから当てる（新しいモーションを読み込んだ直後）。
  視点操作: PolyLing と同じ（polyling_camera.js。ボーン編集と共通）。左ドラッグは使わない。
 ================================================================================
 -->
@@ -46,6 +51,7 @@ html,body{margin:0;height:100%;overflow:hidden;background:#0d1117;color:#cfdae9;
 <button id="fitBtn" title="モデル全体を表示">全体</button>
 <div id="msg">VRM 未読込（上部の「VRM読込」）</div>
 <script src="polyling_camera.js"></script>
+<script src="plmotion_vrma.js"></script>
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
@@ -113,6 +119,34 @@ function applyBones(bones) {
   }
 }
 
+// ---- 表情 ----
+let lastExpr = {};   // 最後に受けた表情（VRM の表情名 → 値）。モデルを読み直したら掛け直す。
+/** 表情トラックの並び → {VRM の表情名: 値}。規則は plmotion_vrma.js の encode（:234-245）と同じ。 */
+function resolveExpressions(list) {
+  const PV = window.PLVrma, out = {}, used = new Set();
+  (Array.isArray(list) ? list : []).forEach(e => {
+    if (!e || !e.name || typeof e.w !== 'number' || !Number.isFinite(e.w)) return;
+    const raw = String(e.name);
+    let name = e.provider === 'vrm1' ? PV.tryGetPreset(raw) : PV.tryResolvePreset(raw, null);
+    let isPreset = !!name; if (!isPreset) name = raw;
+    if (isPreset && PV.isLookPreset(name)) return;
+    if (used.has(name)) {
+      if (isPreset && !used.has(raw) && !PV.tryGetPreset(raw)) name = raw;
+      else return;
+    }
+    used.add(name); out[name] = Math.max(0, Math.min(1, e.w));
+  });
+  return out;
+}
+function applyExpressions(map) {
+  const em = vrm && vrm.expressionManager; if (!em) return;
+  for (const n in map) if (em.getExpression(n)) em.setValue(n, map[n]);
+}
+function zeroExpressions() {
+  const em = vrm && vrm.expressionManager; if (!em) return;
+  em.expressions.forEach(x => em.setValue(x.expressionName, 0));
+}
+
 async function loadVrm(buffer, name) {
   msg.textContent = '読込中: ' + name;
   try {
@@ -127,7 +161,7 @@ async function loadVrm(buffer, name) {
     vrm.humanoid.resetNormalizedPose();
     const hips = vrm.humanoid.getNormalizedBoneNode('hips');
     restHips = hips ? hips.position.clone() : null;
-    applyBones(lastBones);
+    applyBones(lastBones); applyExpressions(lastExpr);
     frameModel(vrm.scene);
     const m = vrm.meta || {};
     msg.textContent = `${m.name || m.title || name}（VRM ${isV0 ? '0.x' : '1.0'}）`;
@@ -141,11 +175,16 @@ window.addEventListener('message', ev => {
   const p = m.payload;
   if (p && p.type === 'pose' && p.bones) {
     const bones = p.bones;
-    if (p.reset) {   // 新しいモーション：T ポーズに戻してから当てる
+    if (p.reset) {   // 新しいモーション：T ポーズ・表情 0 に戻してから当てる
       for (const k in lastBones) delete lastBones[k];
-      if (vrm) { vrm.humanoid.resetNormalizedPose(); }
+      lastExpr = {};
+      if (vrm) { vrm.humanoid.resetNormalizedPose(); zeroExpressions(); }
     }
     Object.assign(lastBones, bones); applyBones(bones);
+    if (Array.isArray(p.expressions)) {
+      const ex = resolveExpressions(p.expressions);
+      Object.assign(lastExpr, ex); applyExpressions(ex);
+    }
   }
 });
 

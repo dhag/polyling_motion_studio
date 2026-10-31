@@ -24,23 +24,25 @@
   'use strict';
 
   // ============================================================ 正準骨格（CanonSkeleton.Table と同じ）
+  // 値の正本は CanonSkeleton.cs の Table。変えたら写す（2026-10-14 の指の変更を 2026-10-31 に写した。
+  // それまで指の Intermediate・Distal が古い値で、.vrma のレスト位置だけが本体の書き出しと違った）。
   const CANON_TABLE = [
     'Hips||0 1 0', 'Spine|Hips|0 0.1 0', 'Chest|Spine|0 0.12 0', 'UpperChest|Chest|0 0.12 0',
     'Neck|UpperChest|0 0.16 0', 'Head|Neck|0 0.1 0', 'LeftEye|Head|-0.03 0.07 0.08', 'RightEye|Head|0.03 0.07 0.08',
     'LeftUpperLeg|Hips|-0.09 -0.05 0', 'LeftLowerLeg|LeftUpperLeg|-0.0105 -0.419869 0', 'LeftFoot|LeftLowerLeg|0 -0.42 0', 'LeftToes|LeftFoot|0 0 0.12',
     'RightUpperLeg|Hips|0.09 -0.05 0', 'RightLowerLeg|RightUpperLeg|0.0105 -0.419869 0', 'RightFoot|RightLowerLeg|0 -0.42 0', 'RightToes|RightFoot|0 0 0.12',
     'LeftShoulder|UpperChest|-0.02 0.12 0', 'LeftUpperArm|LeftShoulder|-0.09993 0.00373 0', 'LeftLowerArm|LeftUpperArm|-0.26 0 0', 'LeftHand|LeftLowerArm|-0.24 0 0',
-    'LeftThumbProximal|LeftHand|-0.02 -0.01 0.025', 'LeftThumbIntermediate|LeftThumbProximal|-0.029233 -0.012881 0.024073', 'LeftThumbDistal|LeftThumbIntermediate|-0.021926 -0.009717 0.018023',
-    'LeftIndexProximal|LeftHand|-0.08 0 0.02', 'LeftIndexIntermediate|LeftIndexProximal|-0.039989 0.00094 0', 'LeftIndexDistal|LeftIndexIntermediate|-0.024994 0.000545 0.000002',
-    'LeftMiddleProximal|LeftHand|-0.08 0 0', 'LeftMiddleIntermediate|LeftMiddleProximal|-0.044988 0.001058 0', 'LeftMiddleDistal|LeftMiddleIntermediate|-0.029993 0.000654 0.000003',
-    'LeftRingProximal|LeftHand|-0.075 0 -0.02', 'LeftRingIntermediate|LeftRingProximal|-0.039989 0.00094 0', 'LeftRingDistal|LeftRingIntermediate|-0.024994 0.000545 0.000005',
-    'LeftLittleProximal|LeftHand|-0.07 0 -0.04', 'LeftLittleIntermediate|LeftLittleProximal|-0.029992 0.000705 0', 'LeftLittleDistal|LeftLittleIntermediate|-0.019995 0.000436 0.000002',
+    'LeftThumbProximal|LeftHand|-0.02 -0.01 0.025', 'LeftThumbIntermediate|LeftThumbProximal|-0.028284 0 0.028284', 'LeftThumbDistal|LeftThumbIntermediate|-0.021213 0 0.021213',
+    'LeftIndexProximal|LeftHand|-0.08 0 0.02', 'LeftIndexIntermediate|LeftIndexProximal|-0.04 0 0', 'LeftIndexDistal|LeftIndexIntermediate|-0.025 0 0',
+    'LeftMiddleProximal|LeftHand|-0.08 0 0', 'LeftMiddleIntermediate|LeftMiddleProximal|-0.045 0 0', 'LeftMiddleDistal|LeftMiddleIntermediate|-0.03 0 0',
+    'LeftRingProximal|LeftHand|-0.075 0 -0.02', 'LeftRingIntermediate|LeftRingProximal|-0.04 0 0', 'LeftRingDistal|LeftRingIntermediate|-0.025 0 0',
+    'LeftLittleProximal|LeftHand|-0.07 0 -0.04', 'LeftLittleIntermediate|LeftLittleProximal|-0.03 0 0', 'LeftLittleDistal|LeftLittleIntermediate|-0.02 0 0',
     'RightShoulder|UpperChest|0.02 0.12 0', 'RightUpperArm|RightShoulder|0.09993 0.00373 0', 'RightLowerArm|RightUpperArm|0.26 0 0', 'RightHand|RightLowerArm|0.24 0 0',
-    'RightThumbProximal|RightHand|0.02 -0.01 0.025', 'RightThumbIntermediate|RightThumbProximal|0.029233 -0.012881 0.024073', 'RightThumbDistal|RightThumbIntermediate|0.021926 -0.009717 0.018023',
-    'RightIndexProximal|RightHand|0.08 0 0.02', 'RightIndexIntermediate|RightIndexProximal|0.039989 0.00094 0', 'RightIndexDistal|RightIndexIntermediate|0.024994 0.000545 0.000002',
-    'RightMiddleProximal|RightHand|0.08 0 0', 'RightMiddleIntermediate|RightMiddleProximal|0.044988 0.001058 0', 'RightMiddleDistal|RightMiddleIntermediate|0.029993 0.000654 0.000003',
-    'RightRingProximal|RightHand|0.075 0 -0.02', 'RightRingIntermediate|RightRingProximal|0.039989 0.00094 0', 'RightRingDistal|RightRingIntermediate|0.024994 0.000545 0.000005',
-    'RightLittleProximal|RightHand|0.07 0 -0.04', 'RightLittleIntermediate|RightLittleProximal|0.029992 0.000705 0', 'RightLittleDistal|RightLittleIntermediate|0.019995 0.000436 0.000002',
+    'RightThumbProximal|RightHand|0.02 -0.01 0.025', 'RightThumbIntermediate|RightThumbProximal|0.028284 0 0.028284', 'RightThumbDistal|RightThumbIntermediate|0.021213 0 0.021213',
+    'RightIndexProximal|RightHand|0.08 0 0.02', 'RightIndexIntermediate|RightIndexProximal|0.04 0 0', 'RightIndexDistal|RightIndexIntermediate|0.025 0 0',
+    'RightMiddleProximal|RightHand|0.08 0 0', 'RightMiddleIntermediate|RightMiddleProximal|0.045 0 0', 'RightMiddleDistal|RightMiddleIntermediate|0.03 0 0',
+    'RightRingProximal|RightHand|0.075 0 -0.02', 'RightRingIntermediate|RightRingProximal|0.04 0 0', 'RightRingDistal|RightRingIntermediate|0.025 0 0',
+    'RightLittleProximal|RightHand|0.07 0 -0.04', 'RightLittleIntermediate|RightLittleProximal|0.03 0 0', 'RightLittleDistal|RightLittleIntermediate|0.02 0 0',
   ];
   const ROWS = CANON_TABLE.map(line => {
     const c = line.split('|');
@@ -110,30 +112,21 @@
   const f32 = v => Math.fround(v);
   const round6 = v => Math.round(f32(v) * 1e6) / 1e6;   // C# の D()：float を 6 桁に
 
-  // ============================================================ PolyLing モーションのキーの評価（線形・回転は Slerp）
-  // 接線（tan / rotTan / posTan）とラップモードは使わない（先頭・末尾の外は端の値）。使っていれば issues に出す。
+  // ============================================================ PolyLing モーションのキーの評価
+  // plmotion_curve.js（PLCurve。規則の正本は MotionCurveMath.cs）で、接線とラップモードを使って評価する。
   const finite = v => typeof v === 'number' && Number.isFinite(v);
-  function keysWith(track, ch, n) {
-    const ks = [];
-    (track && Array.isArray(track.keys) ? track.keys : []).forEach(k => {
-      if (!k || !finite(+k.t)) return;
-      if (ch === 'v') { if (finite(+k.v)) ks.push({ t: +k.t, v: +k.v }); return; }
-      const a = k[ch]; if (Array.isArray(a) && a.length === n && a.every(x => finite(+x))) ks.push({ t: +k.t, v: a.map(Number) });
-    });
-    ks.sort((a, b) => a.t - b.t); return ks;
+  let _curve = null;
+  function curve() {   // 表情名の表だけを使うページ（vrm_viewer.html）では読まないので、使うときに引く
+    if (_curve) return _curve;
+    _curve = root.PLCurve || (typeof require === 'function' ? require('./plmotion_curve.js') : null);
+    if (!_curve) throw new Error('plmotion_curve.js が読み込まれていません');
+    return _curve;
   }
-  function evalKeys(ks, t, mix) {
-    if (!ks.length) return null;
-    if (t <= ks[0].t) return ks[0].v;
-    if (t >= ks[ks.length - 1].t) return ks[ks.length - 1].v;
-    let lo = 0, hi = ks.length - 1;
-    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (ks[mid].t <= t) lo = mid; else hi = mid; }
-    const a = ks[lo], b = ks[hi], d = b.t - a.t;
-    return d > 0 ? mix(a.v, b.v, (t - a.t) / d) : b.v;
-  }
-  const mixRot = (a, b, u) => qslerp(qnorm(a), qnorm(b), u);
-  const mixVec = (a, b, u) => a.map((x, i) => x + (b[i] - x) * u);
-  const mixNum = (a, b, u) => a + (b - a) * u;
+  /** トラックの 1 チャンネル（'rot' / 'pos' / 'v'）。キーが無ければ null。 */
+  function chan(track, ch) { const c = curve().fromTrack(track, ch); return c.t.length ? c : null; }
+  const evalRot = (c, t) => c ? curve().evaluateRotation(c.t, c.v, c.tan, c.pre, c.post, t) : null;
+  const evalVec = (c, t) => c ? curve().evaluateVector(c.t, c.v, c.tan, c.pre, c.post, t, 3) : null;
+  const evalNum = (c, t) => c ? curve().evaluate(c.t, c.v, c.tan, c.pre, c.post, t) : null;
   function maxKeyTime(dto) {
     let m = 0;
     const scan = tr => (tr && Array.isArray(tr.keys) ? tr.keys : []).forEach(k => { if (k && finite(+k.t)) m = Math.max(m, +k.t); });
@@ -185,13 +178,7 @@
       throw new Error((Array.isArray(dto.muscles) && dto.muscles.length)
         ? 'bakedBones がありません。マッスルから骨を解けるのは PolyLing（Unity）だけなので、PolyLing で .plmotion を書き直してから読んでください'
         : 'bakedBones がありません');
-    const usesTan = tr => (tr && Array.isArray(tr.keys) ? tr.keys : []).some(k => k && (k.tan || k.rotTan || k.posTan || k.sclTan));
-    const usesWrap = tr => tr && ((tr.preWrapMode && tr.preWrapMode !== 'Clamp') || (tr.postWrapMode && tr.postWrapMode !== 'Clamp'));
-    const all = Object.values(baked).concat(dto.lookAt ? [dto.lookAt] : [], Array.isArray(dto.expressions) ? dto.expressions : []);
-    if (all.some(usesTan)) report.notes.push('接線は使わず線形で評価しました');
-    if (all.some(usesWrap)) report.notes.push('ラップモード（Loop など）は使わず、端の外は端の値にしました');
-
-    const lookFromTrack = !!(dto.lookAt && keysWith(dto.lookAt, 'rot', 4).length);
+    const lookFromTrack = !!(dto.lookAt && chan(dto.lookAt, 'rot'));
     const lookFromEyes = !lookFromTrack && !!(baked.LeftEye || baked.RightEye);
     report.lookAtSource = lookFromTrack ? 'lookAt' : lookFromEyes ? 'bakedBones の目' : null;
 
@@ -203,25 +190,25 @@
 
     // 骨
     const bones = ROWS.filter(r => isVrmaBone(r.bone)).map(r => r.bone);
-    const keyRot = {}; Object.keys(baked).forEach(id => { keyRot[id] = keysWith(baked[id], 'rot', 4); });
-    const hipsPos = baked.Hips ? keysWith(baked.Hips, 'pos', 3) : [];
-    const lookKeys = lookFromTrack ? keysWith(dto.lookAt, 'rot', 4) : null;
+    const keyRot = {}; Object.keys(baked).forEach(id => { keyRot[id] = chan(baked[id], 'rot'); });
+    const hipsPos = baked.Hips ? chan(baked.Hips, 'pos') : null;
+    const lookKeys = lookFromTrack ? chan(dto.lookAt, 'rot') : null;
     const rot = bones.map(() => []), hips = [], look = report.lookAtSource ? [] : null;
     for (let f = 0; f < n; f++) {
       const t = times[f];
       bones.forEach((b, bi) => {
-        let q = keyRot[b] ? evalKeys(keyRot[b], t, mixRot) : null;
+        let q = evalRot(keyRot[b], t);
         q = qnorm(q || [0, 0, 0, 1]);
         const prev = rot[bi][f - 1]; if (prev && qdot(prev, q) < 0) q = q.map(x => -x);
         rot[bi][f] = q;
       });
-      const off = evalKeys(hipsPos, t, mixVec) || [0, 0, 0];
+      const off = evalVec(hipsPos, t) || [0, 0, 0];
       hips[f] = [HIPS_REST[0] + off[0] * HIPS_HEIGHT, HIPS_REST[1] + off[1] * HIPS_HEIGHT, HIPS_REST[2] + off[2] * HIPS_HEIGHT];
       if (look) {
         let q;
-        if (lookFromTrack) q = evalKeys(lookKeys, t, mixRot) || [0, 0, 0, 1];
+        if (lookFromTrack) q = evalRot(lookKeys, t) || [0, 0, 0, 1];
         else {
-          const ev = id => (keyRot[id] && evalKeys(keyRot[id], t, mixRot)) || [0, 0, 0, 1];
+          const ev = id => evalRot(keyRot[id], t) || [0, 0, 0, 1];
           q = lookAtFromEyes(qnorm(ev('LeftEye')), qnorm(ev('RightEye')));
         }
         q = qnorm(q); const prev = look[f - 1]; if (prev && qdot(prev, q) < 0) q = q.map(x => -x);
@@ -240,7 +227,7 @@
         if (isPreset && !used.has(String(tr.name)) && !tryGetPreset(tr.name)) { vrm = String(tr.name); isPreset = false; }
         else { report.droppedOther.push(tr.name + '（名前の重複）'); return; }
       }
-      used.add(vrm); exprs.push({ vrm, preset: isPreset, keys: keysWith(tr, 'v') });
+      used.add(vrm); exprs.push({ vrm, preset: isPreset, keys: chan(tr, 'v') });
       (isPreset ? report.preset : report.custom).push(vrm);
     });
 
@@ -281,7 +268,7 @@
     if (look) { const d = []; look.forEach(q => d.push(...rotG(q))); channel(lookNode, 'rotation', addFloats(d, 'VEC4', n)); }
     exprs.forEach((e, ei) => {
       const d = [];
-      times.forEach(t => { let w = evalKeys(e.keys, t, mixNum); if (w == null) w = 0; if (w < 0 || w > 1) { report.clamped++; w = Math.max(0, Math.min(1, w)); } d.push(w, 0, 0); });
+      times.forEach(t => { let w = evalNum(e.keys, t); if (w == null) w = 0; if (w < 0 || w > 1) { report.clamped++; w = Math.max(0, Math.min(1, w)); } d.push(w, 0, 0); });
       channel(firstExpr + ei, 'translation', addFloats(d, 'VEC3', n));
     });
 
@@ -648,7 +635,7 @@
     encode, decode, reportText,
     // timeline.html も使う部品
     ROWS, HIPS_REST, HIPS_HEIGHT, isVrmaBone, vrmBoneName, lookAtFromEyes, tryGetPreset, tryResolvePreset, isLookPreset,
-    _test: { qmul, qnorm, qslerp, qeuler, decompose, evalSampler, keysWith, evalKeys },
+    _test: { qmul, qnorm, qslerp, qeuler, decompose, evalSampler },
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else root.PLVrma = API;

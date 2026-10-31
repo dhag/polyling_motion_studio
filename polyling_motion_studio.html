@@ -38,6 +38,8 @@
      {command:'undo'|'redo'}             (bone のみ) その画面で押した Ctrl+Z / Y。タイムラインへ回す
      {file:{name,text か buffer,mime?}}  (timeline のみ) plSave / vrmaSave の結果。外側がダウンロードさせる
      {payload:{type:…}}                  外側はもう一方の画面へ中継する
+                                         （モーションパス：timeline → bone の pathData・pathTarget、bone → timeline の pathRequest。
+                                           中身は timeline.html の「モーションパス」の節）
        type:'pose'     {bones:{名前:{rot:[x,y,z,w],pos?:[x,y,z]}}, frame}  姿勢（両方向）
        type:'skeleton' {bones:[{name,parent,pos,humanoid}]}               骨格（timeline → bone）
        type:'state' / 'hello' / 'bonemap'                                  WebSocket 連携用。中継されるが相手は使わないものもある
@@ -86,8 +88,8 @@ button,input{font:inherit;color:var(--text);background:#121c29;border:1px solid 
   <button id="apply" title="自動キーOFF時のボーン変更を反映">姿勢を反映</button>
   <div class="sep"></div>
   <button id="fit" title="タイムライン全体を表示">全体表示</button>
-  <button id="load" title="PolyLingMotion v1〜v4 を読み込む">PolyLingモーション読込</button>
-  <button id="save" title="PolyLingMotion v4 で保存する">PolyLingモーション保存</button>
+  <button id="load" title="PolyLingMotion v1〜v5 を読み込む">PolyLingモーション読込</button>
+  <button id="save" title="PolyLingMotion v5 で保存する">PolyLingモーション保存</button>
   <div class="sep"></div>
   <button id="vrmLoad" title="VRM モデルを右上に表示する（見るだけ。左の骨格は変わらない）">VRMモデル読込</button>
   <button id="vrmaLoad" title="VRMA を読み込む（タイムラインを置き換える）">VRMAモーション読込</button>
@@ -123,9 +125,13 @@ button,input{font:inherit;color:var(--text);background:#121c29;border:1px solid 
     <tr><td>VRM表示</td><td>「VRM読込」でモデルを右上に表示する。見るだけで、左の骨格やタイムラインは変わらない。Unity の Humanoid 名（Hips など）の骨だけが動く。</td></tr>
     <tr><td>VRMA入出力</td><td>「VRMA読込」はタイムラインを置き換える（骨は bakedBones、表情、視線のトラックになる）。「VRMA保存」は bakedBones の回転・腰の移動・表情・視線を毎フレームで書き出す。基準の骨格は PolyLing の正準骨格。bakedBones の無いモーション（マッスルだけ）は書き出せないので、PolyLing で .plmotion を書き直してから読む。</td></tr>
     <tr><td>ライブ受信</td><td>PolyLing の「ライブ受信」を受け入れ許可にしてから「受信開始」を押すと、PolyLing が解いた骨の姿勢（bones）を上の 2 画面に表示する。表示だけで、タイムラインには書き込まない。接続先は PolyLing のパネルの配信ポートに合わせる。</td></tr>
-    <tr><td>PolyLing入出力</td><td>.plmotion.json（v1〜v4）を読み込み、v4 で保存する。v3 以前の bakedBones と sourceRest は読まない。姿勢の表示は bakedBones から行う。マッスルのあるモーションで bakedBones を変えると、保存時にマッスルと body を書かない（PolyLing が読むときに bakedBones から作り直す）。秒とフレームはfpsで相互変換する。接線とラップモードは保持して書き戻す。動かしていないキーは元の秒のまま書き出す。</td></tr>
+    <tr><td>PolyLing入出力</td><td>.plmotion.json（v1〜v5）を読み込み、v5 で保存する。v5 はトラック・クリップ・バンドル・レイヤーの編集の構造（edit）も書き、読込で元に戻す。v3 以前の bakedBones と sourceRest は読まない。姿勢の表示は bakedBones から行う。マッスルのあるモーションで bakedBones を変えると、保存時にマッスルと body を書かない（PolyLing が読むときに bakedBones から作り直す）。秒とフレームはfpsで相互変換する。接線とラップモードは保持して書き戻す。動かしていないキーは元の秒のまま書き出す。ただし、キーを持つクリップが 2 本以上ある・重み 1 未満のクリップがある・キーを持つクリップがレイヤーに属するトラックは、再生の結果をフレームごとに書く（接線なし、ラップ Clamp）。</td></tr>
+    <tr><td>表情</td><td>表情トラックの値を再生位置ごとに VRM 表示のモデルへ当てる。名前は VRMA 保存と同じ規則で VRM の表情名に引き当てる。</td></tr>
+    <tr><td>グラフエディタ</td><td>トラックのヘッダの 〰 で値カーブに切り替える。キーの点を横へ動かすとフレーム、縦へ動かすと値（回転以外）、選んだキーの接線ハンドルを動かすと傾き（重みのある側は重みも）が変わる。接線のモード・傾き・重みはキーのインスペクタでも変えられる。</td></tr>
+    <tr><td>レイヤー</td><td>バンドルのインスペクタで「レイヤー」にすると、中のクリップが基底の上に重なる（override／additive・重み・ミュート・ソロ・重ねる順。入れ子にできる）。</td></tr>
+    <tr><td>軌跡</td><td>タイムラインで選んだ骨の軌跡を骨格の画面に描く。大きい点はキーのあるフレーム。整数フレームで求める。元に戻す／やり直すの後は選び直す。</td></tr>
   </table>
-  <p>PolyLingの位置・スケール・表情・マッスルは線形補間、回転はSlerpである。接線付きカーブは接線を保持して保存するが、接線の編集と、接線を使った再生はまだできない（再生は線形）。ボーン選択・フレーム・ポーズはページ内で直接同期するため、ローカルWebSocketサーバは不要である。</p>
+  <p>再生はキーの接線とラップモードを使って補間する（規則は PolyLing と同じ。Constant は階段、接線の無いキーどうしは直線、回転は Slerp）。ボーン選択・フレーム・ポーズはページ内で直接同期するため、ローカルWebSocketサーバは不要である。</p>
   <div style="text-align:right"><button id="helpClose" class="primary">閉じる</button></div>
 </div></div>
 <script src="polyling_live.js"></script>

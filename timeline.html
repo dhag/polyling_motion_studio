@@ -11,6 +11,8 @@
           （マッスルから骨を解けるのは PolyLing だけ。PolyLing が書いた .plmotion には bakedBones が付いている）。
           新しいモーションを読み込んだ直後の pose には reset:true が付く（受け手は T ポーズに戻してから当てる）
           （WebSocket 送信 wsSend をそのまま外側にも流している）
+           {from:'timeline', payload:{type:'pathData', start, poses, keys, bone}} / {…payload:{type:'pathTarget', bone}}
+           モーションパス（軌跡）のデータと対象の骨。外側へだけ送る（WebSocket には流さない）。中身は「モーションパス」の節
    受ける: {to:'timeline', command:'frame'|'step'|'play'|'key'|'delete'|'fit'|'undo'|'redo'|'plSave'}
           {to:'timeline', command:'plLoadText', text, name}   外側が開いた .plmotion.json の中身
           {to:'timeline', command:'vrmaLoadData', buffer, name}  外側が開いた .vrma の中身（タイムラインを置き換える）
@@ -19,6 +21,7 @@
           {to:'timeline', payload:{type:'pose'|'skeleton'|…}}
           {to:'timeline', payload:{type:'undoGroup', phase:'begin'|'end'}}  ボーン編集のスライダー操作の始めと終わり。
                                                                         間の姿勢の書き込みを Undo 1 件にまとめる
+          {to:'timeline', payload:{type:'pathRequest'}}  ボーン編集の起動。軌跡のデータと対象を送り直す
  Undo: undo_stack.js の UndoStack に、操作の終わりごとにタイムライン全体の前後の控えを 1 件積む（末尾の「Undo」の節）。
        ファイル読込・骨 CSV 読込・骨格の受信で履歴を消す。トラック・グループ・バンドルの開閉は対象外。
 ================================================================================
@@ -105,6 +108,14 @@
         text-align:center;border-radius:4px;opacity:.55}
   .head .act{flex:none;width:14px;text-align:center;font-size:10px;color:var(--dim2);cursor:pointer;border-radius:3px}
   .head .act:hover{background:#15222b;color:var(--tl)}
+  .head .cvb{flex:none;width:16px;text-align:center;font-size:11px;color:var(--dim2);cursor:pointer;border-radius:3px}
+  .head .cvb:hover{background:#15222b;color:var(--tl)}
+  .head .cvb.on{color:var(--cy)}
+  .head .chsel{margin-top:4px;background:var(--rail);color:var(--tx);border:1px solid var(--bd);border-radius:4px;padding:2px 3px;font-size:10.5px;width:100%}
+  .row select{flex:1;min-width:0;background:var(--rail);border:1px solid var(--bd);color:var(--tx);border-radius:5px;padding:3px 4px;font-size:11px}
+  .tanbox{margin-top:6px;padding:4px 6px;border:1px solid var(--bd);border-radius:6px;background:var(--rail)}
+  .tanbox .row{margin:4px 0}
+  .tanbox input::placeholder{color:var(--dim2)}
   .head.active{background:linear-gradient(90deg,rgba(56,189,248,.12),transparent 70%)}
   .head.active .swatch{box-shadow:0 0 8px var(--cy)}
   .head.active .act{color:var(--cy)}
@@ -208,6 +219,7 @@
   ::-webkit-scrollbar-thumb{background:#1e2a3c;border-radius:6px}
   ::-webkit-scrollbar-track{background:transparent}
 </style>
+<script src="plmotion_curve.js"></script>
 <script src="plmotion_vrma.js"></script>
 <script src="undo_stack.js"></script>
 </head>
@@ -344,18 +356,30 @@ const Q = {
     let sp=2*(w*y-z*x);sp=M.clamp(sp,-1,1);const pitch=Math.asin(sp);
     const sy=2*(w*z+x*y),cy=1-2*(y*y+z*z),yaw=Math.atan2(sy,cy);
     return[roll*180/Math.PI,pitch*180/Math.PI,yaw*180/Math.PI];},
-  slerp(a,b,t){let[ax,ay,az,aw]=a,[bx,by,bz,bw]=b;let c=ax*bx+ay*by+az*bz+aw*bw;
-    if(c<0){bx=-bx;by=-by;bz=-bz;bw=-bw;c=-c;}
-    if(c>0.9995)return Q.norm([ax+t*(bx-ax),ay+t*(by-ay),az+t*(bz-az),aw+t*(bw-aw)]);
-    const an=Math.acos(c),s=Math.sin(an),t0=Math.sin((1-t)*an)/s,t1=Math.sin(t*an)/s;
-    return[ax*t0+bx*t1,ay*t0+by*t1,az*t0+bz*t1,aw*t0+bw*t1];},
 };
+// 混ぜ方（クロスフェード・レイヤー・クリップの重み）。回転は PLCurve.slerp（本体の Quaternion.Slerp の写し）。
+// 規則の正本は PolyLing の MotionEditFlattener.cs（KIND の rest・mix・weight）。
 const KIND = {
-  quat:{rest:()=>[0,0,0,1],mix:(a,b,t)=>Q.slerp(a,b,t),weight:(v,w)=>Q.slerp([0,0,0,1],v,w)},
+  quat:{rest:()=>[0,0,0,1],mix:(a,b,t)=>PLCurve.slerp(a,b,t),weight:(v,w)=>PLCurve.slerp([0,0,0,1],v,w)},
   vec3:{rest:()=>[0,0,0],mix:(a,b,t)=>M.lerp3(a,b,t),weight:(v,w)=>[v[0]*w,v[1]*w,v[2]*w]},
   scale3:{rest:()=>[1,1,1],mix:(a,b,t)=>M.lerp3(a,b,t),weight:(v,w)=>M.lerp3([1,1,1],v,w)},
   scalar:{rest:()=>0,mix:(a,b,t)=>M.lerp(a,b,t),weight:(v,w)=>v*w},
 };
+
+/* ---- キー列の評価（plmotion_curve.js の PLCurve。規則の正本は PolyLing の MotionCurveMath.cs）----
+   キー時刻は秒：元の秒 t0 がそのフレームにあれば t0、無ければ (クリップ開始 + フレーム) / fps（保存の plKeyMap と同じ）。
+   ラップは保存で書く値（trackWrap）。回転は保存と同じく符号を隣と揃えてから評価する。 */
+function trackWrap(track){const loop=track.clips.some(c=>c.loop);
+  return{pre:track.preWrapMode||'Clamp',post:track.postWrapMode||(loop?'Loop':'Clamp')};}
+function tlFps(track){const f=track&&track.tl?+track.tl.fps:NaN;return Number.isFinite(f)&&f>0?f:30;}
+function keySec(clip,k,fps){const f=Math.round(clip.start+k.f);
+  return(k.t0!=null&&Number.isFinite(+k.t0)&&Math.round(+k.t0*fps)===f)?+k.t0:f/fps;}
+// rows: [{t, v, tan}]（時刻の昇順）を kind に応じて評価する。
+function evalRows(kind,rows,wrap,time){
+  const t=rows.map(r=>r.t),v=rows.map(r=>r.v),tan=rows.map(r=>r.tan==null?null:r.tan);
+  if(kind==='quat'){const c=PLCurve.ensureQuaternionContinuity(v,tan);return PLCurve.evaluateRotation(t,c.v,c.tan,wrap.pre,wrap.post,time);}
+  if(kind==='scalar')return PLCurve.evaluate(t,v,tan,wrap.pre,wrap.post,time);
+  return PLCurve.evaluateVector(t,v,tan,wrap.pre,wrap.post,time,3);}
 
 /* ============================================================================ 2. モデル */
 let _uid=1; const uid=p=>p+(_uid++);
@@ -383,6 +407,10 @@ class Clip {
       const arr=this.keys[ch.name],ex=arr.find(k=>k.f===lf),val=Array.isArray(v)?v.slice():v;
       if(ex)ex.v=val;else arr.push({f:lf,v:val});});
     this._sort();return lf;}
+  // 1 チャンネルだけのキー（本体の MotionEditOps.SetChannelKey・RemoveChannelKey と同じ規則）。lf は 0 以上 len 未満、無ければ {f, v} を足す
+  setChannelKey(ch,lf,v){const arr=this.keys[ch];if(!arr||!(lf>=0&&lf<this.len))return null;lf=Math.round(M.clamp(lf,0,this.len-1));
+    const ex=arr.find(k=>k.f===lf),val=Array.isArray(v)?v.slice():v;if(ex)ex.v=val;else arr.push({f:lf,v:val});this._sort();return lf;}
+  removeChannelKey(ch,lf){const arr=this.keys[ch];if(!arr||!arr.some(k=>k.f===lf))return false;this.keys[ch]=arr.filter(k=>k.f!==lf);return true;}
   removeKeyAt(lf){for(const ch in this.keys)this.keys[ch]=this.keys[ch].filter(k=>k.f!==lf);}
   moveKey(lf,nlf){nlf=Math.round(M.clamp(nlf,0,this.len-1));
     if(nlf!==lf&&this.keyFrames().includes(nlf))return lf;
@@ -390,12 +418,9 @@ class Clip {
   sampleChannel(name,lf){
     const def=this.track.channels.find(c=>c.name===name),kd=KIND[def.kind],keys=this.keys[name];
     if(!keys.length)return kd.rest();
-    if(this.loop&&this.len>0)lf=((lf%this.len)+this.len)%this.len;
-    if(lf<=keys[0].f)return keys[0].v;
-    if(lf>=keys[keys.length-1].f)return keys[keys.length-1].v;
-    for(let i=0;i<keys.length-1;i++){const a=keys[i],b=keys[i+1];
-      if(lf>=a.f&&lf<=b.f){const t=(lf-a.f)/((b.f-a.f)||1);return kd.mix(a.v,b.v,t);}}
-    return keys[keys.length-1].v;}
+    const fps=tlFps(this.track);
+    const rows=keys.map(k=>({t:keySec(this,k,fps),v:k.v,tan:k.tan})).sort((a,b)=>a.t-b.t);
+    return evalRows(def.kind,rows,trackWrap(this.track),(this.start+lf)/fps);}
   sampleAt(name,f){const def=this.track.channels.find(c=>c.name===name),kd=KIND[def.kind];
     const v=this.sampleChannel(name,f-this.start);return this.weight>=1?v:kd.weight(v,this.weight);}
   contains(f){return f>=this.start&&f<this.end;}
@@ -409,34 +434,56 @@ class Track {
     this.preWrapMode=o.preWrapMode||null;this.postWrapMode=o.postWrapMode||null;
     this.plCategory=o.plCategory||null;this.plProvider=o.plProvider||null;
     this.color=o.color||'#38bdf8';this.expanded=o.expanded||false;this.group=o.group||null;
+    this.view=o.view==='curve'?'curve':'dope';this.curveCh=o.curveCh||null;   // 展開時の表示（ドープシート／値カーブ）と、カーブに出すチャンネル
     this.clips=(o.clips||[]).map(c=>new Clip(this,c));}
   addClip(o){const c=new Clip(this,o);this.clips.push(c);this.clips.sort((a,b)=>a.start-b.start);return c;}
   removeClip(c){this.clips=this.clips.filter(x=>x!==c);}
-  sampleContinuous(ch,f){
-    const kd=KIND[ch.kind],all=[];
-    this.clips.forEach((c,ci)=>(c.keys[ch.name]||[]).forEach(k=>{
-      const v=c.weight>=1?k.v:kd.weight(k.v,c.weight);
-      all.push({f:c.start+k.f,v,ci});}));
-    if(!all.length)return kd.rest();
-    all.sort((a,b)=>a.f-b.f||a.ci-b.ci);
-    let prev=null,next=null;
-    for(const k of all){if(k.f<=f)prev=k;if(k.f>=f){next=k;break;}}
-    if(prev&&next){if(prev.f===next.f)return next.v;
-      const t=M.clamp((f-prev.f)/(next.f-prev.f),0,1);return kd.mix(prev.v,next.v,t);}
-    if(prev)return prev.v;                    // 最終キー以降は最後の姿勢を保持
-    return kd.rest();}                        // 最初のキーより前はレスト姿勢
-  sample(f){const act=this.clips.filter(c=>c.contains(f)).sort((a,b)=>a.start-b.start),out={};
-    this.channels.forEach(ch=>{const kd=KIND[ch.kind],chanAct=act.filter(c=>{const ks=c.keys[ch.name]||[];
+  // ※ sampleContinuous・sampleClips・sampleCh と layerInfo、保存の plNeedsBake・plBakeKeys・plKeyMap・plMakeTrack の規則の正本は
+  //    PolyLing の MotionEditFlattener.cs（edit から平らなトラックを作る）。変えるときは両方をそろえる。
+  // 全クリップのキーを保存（plKeyMap）と同じ並べ方で 1 列にして評価する。同じフレームのキーは開始の遅いクリップが勝つ。
+  // 重み 1 未満のクリップのキーは重みを掛けた値を接線なしで並べる（重みを掛けた値に元の接線は合わない）。
+  // 最初のキーより前・最後のキーより後はトラックのラップモード（既定 Clamp は端のキーの値）。
+  // クリップが 2 本以上か重み 1 未満、またはレイヤーに属するクリップがあるトラックは、保存（plNeedsBake）が Track.sample を標本化して書く。
+  // clips: 対象のクリップ（既定は全クリップ。レイヤーがあるときは基底・レイヤーごとのクリップ）
+  sampleContinuous(ch,f,clips){
+    const kd=KIND[ch.kind],fps=tlFps(this),map=new Map();
+    [...(clips||this.clips)].sort((a,b)=>a.start-b.start).forEach(c=>(c.keys[ch.name]||[]).forEach(k=>{
+      const fr=Math.round(c.start+k.f),old=map.get(fr),w=c.weight>=1;
+      map.set(fr,{t:old?old.t:keySec(c,k,fps),v:w?k.v:kd.weight(k.v,c.weight),tan:w?k.tan:null});}));
+    if(!map.size)return kd.rest();
+    const rows=[...map.entries()].sort((a,b)=>a[0]-b[0]).map(e=>e[1]);
+    return evalRows(ch.kind,rows,trackWrap(this),f/fps);}
+  // 1 チャンネルの評価（再生 sample とグラフエディタの線が通る）。f は小数のフレームでもよい
+  // レイヤー（layer を持つバンドル）が無ければ全クリップで評価する。あれば、レイヤーに属さないクリップ（基底）を評価し、
+  // その上にレイヤーを重ねる順（layerInfo）に合成する。レイヤーごとの値はそのレイヤーに直接属するクリップで基底と同じ評価をする。
+  // そのレイヤーのクリップにこのチャンネルのキーが無ければ何もしない。実効のミュートは飛ばし、重みは実効の重みを使う。
+  sampleCh(ch,f){const info=layerInfo(this.tl);
+    if(!info)return this.sampleClips(ch,f,this.clips);
+    const kd=KIND[ch.kind],base=this.clips.filter(c=>!info.clipLayer.get(c.id));
+    let acc=this.sampleClips(ch,f,base);
+    for(const L of info.order){const e=info.eff.get(L.id);if(e.mute||!(e.w>0))continue;
+      const lc=this.clips.filter(c=>info.clipLayer.get(c.id)===L);
+      if(!lc.some(c=>(c.keys[ch.name]||[]).length))continue;
+      const v=this.sampleClips(ch,f,lc),w=e.w;
+      if(L.layer.mode==='additive'){
+        if(ch.kind==='quat')acc=Q.norm(Q.mul(acc,kd.weight(v,w)));
+        else if(ch.kind==='scalar')acc=acc+w*v;
+        else if(ch.kind==='scale3')acc=[0,1,2].map(i=>acc[i]*M.lerp(1,v[i],w));
+        else acc=[0,1,2].map(i=>acc[i]+w*v[i]);}
+      else acc=kd.mix(acc,v,w);}
+    return acc;}
+  // clips だけでの評価（有効なクリップのクロスフェード。無ければ sampleContinuous。キーが無ければレスト）
+  sampleClips(ch,f,clips){const kd=KIND[ch.kind],chanAct=clips.filter(c=>c.contains(f)).sort((a,b)=>a.start-b.start).filter(c=>{const ks=c.keys[ch.name]||[];
         if(!ks.length)return false;if(c.loop)return true;const lf=f-c.start;return lf>=ks[0].f&&lf<=ks[ks.length-1].f;});
-      if(!chanAct.length){out[ch.name]=this.sampleContinuous(ch,f);return;}
-      let acc=chanAct[0].sampleAt(ch.name,f);
-      for(let i=1;i<chanAct.length;i++){const prev=chanAct[i-1],cur=chanAct[i];
-        const ov0=cur.start,ov1=Math.min(prev.end,cur.end);let w=M.clamp((f-ov0)/((ov1-ov0)||1),0,1);
-        acc=kd.mix(acc,cur.sampleAt(ch.name,f),w);}
-      out[ch.name]=acc;});
-    return out;}
+    if(!chanAct.length)return this.sampleContinuous(ch,f,clips);
+    let acc=chanAct[0].sampleAt(ch.name,f);
+    for(let i=1;i<chanAct.length;i++){const prev=chanAct[i-1],cur=chanAct[i];
+      const ov0=cur.start,ov1=Math.min(prev.end,cur.end);let w=M.clamp((f-ov0)/((ov1-ov0)||1),0,1);
+      acc=kd.mix(acc,cur.sampleAt(ch.name,f),w);}
+    return acc;}
+  sample(f){const out={};this.channels.forEach(ch=>{out[ch.name]=this.sampleCh(ch,f);});return out;}
   toJSON(){return{id:this.id,type:this.type,name:this.name,uname:this.uname,color:this.color,expanded:this.expanded,
-    group:this.group,plRole:this.plRole,plTargetKind:this.plTargetKind,preWrapMode:this.preWrapMode,postWrapMode:this.postWrapMode,
+    view:this.view,curveCh:this.curveCh,group:this.group,plRole:this.plRole,plTargetKind:this.plTargetKind,preWrapMode:this.preWrapMode,postWrapMode:this.postWrapMode,
     plCategory:this.plCategory,plProvider:this.plProvider,clips:this.clips.map(c=>c.toJSON())};}
 }
 class Group{constructor(o={}){this.id=o.id||uid('g');this.name=o.name||'グループ';
@@ -447,9 +494,32 @@ class Bundle{constructor(o={}){this.id=o.id||uid('b');this.name=o.name||'バン�
   this.color=o.color||'#a78bfa';this.collapsed=o.collapsed||false;
   this.clipIds=o.clipIds?[...o.clipIds]:[];   // 直接メンバ(リーフ・クリップ)
   this.childIds=o.childIds?[...o.childIds]:[]; // 入れ子の子バンドル
-  this.parentId=o.parentId||null;}
-  toJSON(){return{id:this.id,name:this.name,color:this.color,collapsed:this.collapsed,
-    clipIds:this.clipIds,childIds:this.childIds,parentId:this.parentId};}}
+  this.parentId=o.parentId||null;
+  this.layer=normLayer(o.layer);}   // レイヤーの設定（null ならレイヤーではない）
+  toJSON(){const o={id:this.id,name:this.name,color:this.color,collapsed:this.collapsed,
+    clipIds:this.clipIds,childIds:this.childIds,parentId:this.parentId};
+    if(this.layer)o.layer={...this.layer};return o;}}
+// アニメーションレイヤー：mode override（下を値へ寄せる）／additive（下に足す）、weight 0〜1、mute、solo
+function normLayer(l){if(!l||typeof l!=='object')return null;const w=+l.weight;
+  return{mode:l.mode==='additive'?'additive':'override',weight:Number.isFinite(w)?M.clamp(w,0,1):1,mute:!!l.mute,solo:!!l.solo};}
+// レイヤーの構造（m: MotionTimeline）。layer を持つバンドルが無ければ null。
+//  clipLayer: クリップ ID → 所属レイヤー（直接属するバンドルから親をたどって最初のレイヤー。無ければ基底）
+//  parent: レイヤー ID → 親のレイヤー（自分の親から同じたどり方。間のレイヤーでないバンドルは飛ばす。根は null）
+//  order: 重ねる順。上位バンドル（tl.bundles の並び）から childIds の順に深さ優先でたどった順（親の後に子）
+//  eff: レイヤー ID → {w: 自分 × 祖先の重み, mute: 自分か祖先のミュート、または同じ親の兄弟にソロがあり自分はソロでない}
+function layerInfo(m){if(!m||!m.bundles||!m.bundles.some(b=>b.layer))return null;
+  const byId=new Map(m.bundles.map(b=>[b.id,b]));
+  const up=b=>{const seen=new Set();while(b&&!seen.has(b.id)){if(b.layer)return b;seen.add(b.id);b=b.parentId?byId.get(b.parentId):null;}return null;};
+  const parent=new Map(),order=[],eff=new Map(),clipLayer=new Map(),seen=new Set();
+  const visit=b=>{if(!b||seen.has(b.id))return;seen.add(b.id);
+    if(b.layer){order.push(b);parent.set(b.id,up(b.parentId?byId.get(b.parentId):null));}
+    b.childIds.forEach(id=>visit(byId.get(id)));};
+  m.bundles.filter(b=>!b.parentId||!byId.has(b.parentId)).forEach(visit);
+  order.forEach(L=>{const p=parent.get(L.id),pe=p?eff.get(p.id):null;
+    const sibSolo=order.some(x=>parent.get(x.id)===p&&x.layer.solo);
+    eff.set(L.id,{w:L.layer.weight*(pe?pe.w:1),mute:L.layer.mute||(sibSolo&&!L.layer.solo)||!!(pe&&pe.mute)});});
+  m.bundles.forEach(b=>{const L=up(b);if(L&&eff.has(L.id))b.clipIds.forEach(id=>clipLayer.set(id,L));});
+  return{clipLayer,parent,order,eff};}
 class MotionTimeline {
   constructor(o={}){this.fps=o.fps||30;this.groups=(o.groups||[]).map(g=>new Group(g));
     this.tracks=(o.tracks||[]).map(t=>new Track(this,t));
@@ -505,10 +575,13 @@ function bMoveBy(b,delta){const cs=bAllClips(b);if(!cs.length)return;
   const mn=Math.min(...cs.map(c=>c.start));if(mn+delta<0)delta=-mn;
   cs.forEach(c=>c.start+=delta);bTracks(b).forEach(t=>t.clips.sort((a,b2)=>a.start-b2.start));}
 function bSetStart(b,ns){const bd=bBounds(b);if(bd)bMoveBy(b,Math.round(ns)-bd.start);}
-function bClone(b,dStart){const nb=tl.addBundle({name:b.name,color:b.color,collapsed:b.collapsed,parentId:b.parentId});
+// 複製は元と同じ親の子にする（親の childIds にも入れる。parentId と childIds を食い違わせない）
+function bClone(b,dStart,parentId){const pid=parentId===undefined?b.parentId:parentId;
+  const nb=tl.addBundle({name:b.name,color:b.color,collapsed:b.collapsed,parentId:pid,layer:b.layer});
+  if(parentId===undefined&&pid){const par=tl.getBundle(pid);if(par)par.childIds.push(nb.id);else nb.parentId=null;}
   bDirectClips(b).forEach(c=>{const t=tl.trackOfClip(c);
     const nc=t.addClip({...c.toJSON(),id:undefined,start:c.start+dStart});nb.clipIds.push(nc.id);});
-  bChildren(b).forEach(ch=>{const nch=bClone(ch,dStart);nch.parentId=nb.id;nb.childIds.push(nch.id);});
+  bChildren(b).forEach(ch=>{const nch=bClone(ch,dStart,nb.id);nb.childIds.push(nch.id);});
   return nb;}
 function bUngroup(b){ // バンドルだけ解除（クリップ/子は残す。子は親へ昇格）
   bChildren(b).forEach(ch=>ch.parentId=b.parentId);
@@ -523,14 +596,22 @@ function bMakeFrom(items,name){ // items: [{type:'clip',clip}|{type:'bundle',bun
   const clipIds=[],childIds=[];
   items.forEach(it=>{if(it.type==='clip'){const old=bClipMember(it.clip);
       if(old)old.clipIds=old.clipIds.filter(id=>id!==it.clip.id); clipIds.push(it.clip.id);}
-    else if(it.type==='bundle'){childIds.push(it.bundle.id);}});
+    else if(it.type==='bundle'){const op=it.bundle.parentId&&tl.getBundle(it.bundle.parentId);   // 元の親の childIds から除く
+      if(op)op.childIds=op.childIds.filter(id=>id!==it.bundle.id);childIds.push(it.bundle.id);}});
   const col=PAL[(tl.bundles.length+2)%PAL.length];
   const b=tl.addBundle({name:name||'バンドル',color:col,clipIds,childIds});
   childIds.forEach(id=>{const ch=tl.getBundle(id);if(ch)ch.parentId=b.id;});
   return b;}
+// 重ねる順の入れ替え：同じ入れ物（上位バンドルなら tl.bundles、子なら親の childIds）の中で、dir 方向の隣のレイヤーと入れ替える
+function layerSwapTarget(b,dir){if(!b.layer)return null;const par=b.parentId&&tl.getBundle(b.parentId);
+  const list=par?bChildren(par):bTopLevel();const i0=list.indexOf(b);if(i0<0)return null;
+  for(let j=i0+dir;j>=0&&j<list.length;j+=dir)if(list[j].layer)return list[j];return null;}
+function layerSwap(b,dir){const o=layerSwapTarget(b,dir);if(!o)return;const par=b.parentId&&tl.getBundle(b.parentId);
+  const arr=par?par.childIds:tl.bundles,key=par?(x=>x.id):(x=>x);
+  const ia=arr.indexOf(key(b)),ib=arr.indexOf(key(o));if(ia<0||ib<0)return;arr[ia]=key(o);arr[ib]=key(b);}
 
 /* ============================================================================ 4. ビュー */
-const RULER_H=30,GROUP_H=26,ROW_C=42,ROW_X=88,CLIP_H=26;
+const RULER_H=30,GROUP_H=26,ROW_C=42,ROW_X=88,ROW_G=220,CLIP_H=26;   // ROW_G: 値カーブ表示で展開したトラックの高さ
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
 const cwrap=document.getElementById('cwrap'),cvArea=document.getElementById('cvArea'),headRows=document.getElementById('headRows');
 const hscroll=document.getElementById('hscroll'),hthumb=document.getElementById('hthumb'),vscroll=document.getElementById('vscroll'),vthumb=document.getElementById('vthumb');
@@ -590,7 +671,9 @@ function syncKeySel(){sel=keySel.length>1?{type:'keyset'}:keySel.length===1?{typ
 function keysInRect(r){const out=[],xa=Math.min(r.x0,r.x1),xb=Math.max(r.x0,r.x1),
   ya=Math.min(r.y0,r.y1),yb=Math.max(r.y0,r.y1);
   for(const row of LAYOUT){if(row.kind!=='track'||!row.track.expanded)continue;
-    const cy=RULER_H+row.y-scrollY+ROW_C+(ROW_X-ROW_C)/2; if(cy<ya||cy>yb)continue;
+    const lt=RULER_H+row.y-scrollY+ROW_C;
+    if(row.track.view==='curve'){if(lt+(ROW_G-ROW_C)<ya||lt>yb)continue;}   // 値カーブは行に掛かれば時刻の範囲で選ぶ
+    else{const cy=lt+(ROW_X-ROW_C)/2; if(cy<ya||cy>yb)continue;}
     for(const c of row.track.clips){if(hiddenClips.has(c))continue;
       for(const lf of c.keyFrames()){const kx=fx(c.start+lf);if(kx>=xa&&kx<=xb)out.push({clip:c,lf});}}}
   return out;}
@@ -599,7 +682,7 @@ function toggleMark(item){const i=marked.findIndex(m=>m.type===item.type&&(m.cli
   if(i>=0)marked.splice(i,1);else marked.push(item);}
 let dpr=1,W=0,H=0;
 function fx(f){return(f-view.start)*view.ppf;} function xf(x){return view.start+x/view.ppf;}
-function rowH(t){return t.expanded?ROW_X:ROW_C;}
+function rowH(t){return t.expanded?(t.view==='curve'?ROW_G:ROW_X):ROW_C;}
 function maxScroll(){return Math.max(0,contentH-(H-RULER_H));}
 
 function layoutRows(){const rows=[];let y=0,seen=new Set();
@@ -630,7 +713,7 @@ function draw(){
     ctx.strokeStyle=(f%(step*5)===0)?getCSS('--grid2'):getCSS('--grid');
     ctx.beginPath();ctx.moveTo(x+.5,RULER_H);ctx.lineTo(x+.5,H);ctx.stroke();}
   // 折りたたみバンドルのメンバ・クリップを非表示に
-  computeHidden();
+  computeHidden();CURVE_GEOM=new Map();
   // 行
   LAYOUT.forEach((r,i)=>{
     const yT=RULER_H+r.y-scrollY; if(yT>H||yT+r.h<RULER_H)return;
@@ -664,13 +747,14 @@ function drawGroupRow(g,yT){
 }
 function drawTrackRow(t,yT,i){
   ctx.fillStyle=i%2?'#0d131e':'#0b1019';ctx.fillRect(0,yT,W,rowH(t));
-  if(t.expanded){ctx.fillStyle='#090d15';ctx.fillRect(0,yT+ROW_C,W,ROW_X-ROW_C);}
+  if(t.expanded){ctx.fillStyle='#090d15';ctx.fillRect(0,yT+ROW_C,W,rowH(t)-ROW_C);}
   const laneY=yT+(ROW_C-CLIP_H)/2;
   t.clips.forEach(c=>{if(hiddenClips.has(c))return;const x=fx(c.start),w=c.len*view.ppf;if(x+w<0||x>W)return;
     drawClip(c,x,laneY,w,t.color,sel&&sel.type==='clip'&&sel.clip===c);
     if(isMarked('clip',c)){ctx.setLineDash([4,3]);ctx.lineWidth=1.5;ctx.strokeStyle=getCSS('--sel');
       roundRect(x-1,laneY-1,w+2,CLIP_H+2,7);ctx.stroke();ctx.setLineDash([]);}
-    if(t.expanded)drawDope(c,x,w,yT+ROW_C,ROW_X-ROW_C,t.color);});
+    if(t.expanded&&t.view!=='curve')drawDope(c,x,w,yT+ROW_C,ROW_X-ROW_C,t.color);});
+  if(t.expanded&&t.view==='curve')drawCurve(t,yT+ROW_C,ROW_G-ROW_C);
   ctx.strokeStyle=getCSS('--bd');ctx.beginPath();ctx.moveTo(0,yT+rowH(t)+.5);ctx.lineTo(W,yT+rowH(t)+.5);ctx.stroke();
 }
 function computeHidden(){hiddenClips=new Set();
@@ -695,12 +779,16 @@ function drawBundle(b){
     ctx.lineWidth=selB?2.5:1.5;ctx.strokeStyle=selB?getCSS('--sel'):hexA(b.color,.85);
     ctx.setLineDash(mk?[5,4]:[]);roundRect(rx,ry,rw,rh,7);ctx.stroke();ctx.setLineDash([]);
   }
-  // ヘッダ・タブ（掴むと選択/一括移動）
-  const tabW=Math.min(Math.max(ctx.measureText(b.name).width+24,52),Math.max(52,w+6));
+  // ヘッダ・タブ（掴むと選択/一括移動）。レイヤーは方式・重み・ミュート(M)・ソロ(S)を出し、実効でミュートなら薄くする
+  let label=(b.collapsed?'▸ ':'▾ ')+b.name,lyMuted=false;
+  if(b.layer){const L=b.layer,info=layerInfo(tl),e=info&&info.eff.get(b.id);lyMuted=!!(e&&e.mute);
+    label+=` [${L.mode==='additive'?'ADD':'OVR'} ${L.weight.toFixed(2)}${L.mute?' M':''}${L.solo?' S':''}]`;}
+  const tabW=Math.min(Math.max(ctx.measureText(label).width+12,52),Math.max(52,w+6));
   const tabX=Math.max(rx,0),tabY=Math.max(ry-13,RULER_H+1);
+  ctx.globalAlpha=lyMuted?0.45:1;
   ctx.fillStyle=selB?getCSS('--sel'):b.color;roundRect(tabX,tabY,tabW,14,4);ctx.fill();
   ctx.fillStyle='#08101a';ctx.textBaseline='middle';
-  ctx.fillText((b.collapsed?'▸ ':'▾ ')+b.name,tabX+6,tabY+8);
+  ctx.fillText(label,tabX+6,tabY+8);ctx.globalAlpha=1;
   BUNDLE_RECTS.push({b,tab:{x:tabX,y:tabY,w:tabW,h:14},box:{x:rx,y:ry,w:rw,h:rh}});
   if(!b.collapsed)bChildren(b).forEach(drawBundle);
 }
@@ -727,6 +815,118 @@ function drawDope(c,x,w,laneTop,laneH,col){const cy=laneTop+laneH/2;
     return;}
   kfs.forEach(lf=>{const kx=fx(c.start+lf);if(kx<-6||kx>W+6)return;
     const on=keySelHas(c,lf);diamond(kx,cy,on?6:5,on?getCSS('--sel'):col,on);});}
+/* ---- グラフエディタ（値カーブ）----
+   線は Track.sampleCh（再生の sample と同じ評価）を 2px ごとに評価して引く。
+   キーと接線ハンドルは、クリップのキー列を Clip.sampleChannel と同じ並べ方（時刻順。回転は符号を隣と揃える）で描く。
+   接線はキーの tan に書く（スカラーは接線オブジェクト、位置・回転・スケールは成分数の長さの配列で、触っていない成分は null）。
+   tan が無いキーは編集したときだけ作る。両側 Linear で作るので、作っただけでは傾きは変わらない（tan が無いキーと同じ求め方）。
+   回転で符号を反転して表示しているキーは、傾きの符号を戻して書く。 */
+const CURVE_COL=['#f87171','#4ade80','#60a5fa','#cbd5e1'],CURVE_PAD=12,HANDLE_LEN=40;
+const TAN_DIM={quat:4,vec3:3,scale3:3,scalar:1};
+const TAN_MODES=['Constant','Linear','Auto','ClampedAuto','Free'],TAN_MODE_LABEL={Constant:'Constant',Linear:'線形',Auto:'Auto',ClampedAuto:'ClampedAuto',Free:'Free'};
+const SIDE={in:{mode:'leftTangentMode',val:'inTangent',w:'inWeight',wm:'In'},out:{mode:'rightTangentMode',val:'outTangent',w:'outWeight',wm:'Out'}};
+let CURVE_GEOM=new Map(),curveSel=null;   // curveSel: {trackId, ch, comp} グラフエディタとインスペクタで選んだ成分
+const isTanObj=x=>!!x&&typeof x==='object'&&!Array.isArray(x);
+const modeIs=(s,m)=>typeof s==='string'&&s.toLowerCase()===m.toLowerCase();
+function normMode(s){return TAN_MODES.find(m=>modeIs(s,m))||'Free';}   // null は Free（MotionClipDTO）
+function hasKeys(t,ch){return t.clips.some(c=>(c.keys[ch.name]||[]).length);}
+function curveChOf(t){return t.channels.find(ch=>ch.name===t.curveCh)||t.channels.find(ch=>hasKeys(t,ch))||t.channels[0];}
+function selComp(t,ch){return curveSel&&curveSel.trackId===t.id&&curveSel.ch===ch.name?Math.min(curveSel.comp,TAN_DIM[ch.kind]-1):0;}
+const allComps=ch=>[...Array(TAN_DIM[ch.kind]).keys()];
+// クリップの 1 チャンネルのキー列（Clip.sampleChannel と同じ並べ方。回転は符号を揃えた値と、そのキーを反転したか）
+function chanData(clip,ch){const fps=tlFps(clip.track);
+  const rows=(clip.keys[ch.name]||[]).map(k=>({k,t:keySec(clip,k,fps)})).sort((a,b)=>a.t-b.t);
+  const t=rows.map(r=>r.t),raw=rows.map(r=>r.k.v),rawTan=rows.map(r=>r.k.tan==null?null:r.k.tan),flip=rows.map(()=>false);
+  let v=raw,tan=rawTan;
+  if(ch.kind==='quat'){const c=PLCurve.ensureQuaternionContinuity(raw,rawTan);v=c.v;tan=c.tan;
+    let prev=null;raw.forEach((q,j)=>{if(prev&&prev[0]*q[0]+prev[1]*q[1]+prev[2]*q[2]+prev[3]*q[3]<0)flip[j]=true;prev=v[j];});}
+  return{rows,t,v,tan,flip};}
+function keyIndex(d,k){return d.rows.findIndex(r=>r.k===k);}
+function compSeries(d,kind,c){
+  if(kind==='scalar')return{v:d.v.map(Number),tan:d.tan.map(a=>isTanObj(a)?a:null)};
+  return{v:d.v.map(x=>x[c]),tan:d.tan.map(a=>Array.isArray(a)&&a.length>c&&isTanObj(a[c])?a[c]:null)};}
+// キー j の成分 c：入・出の傾き（表示の符号。値/秒、PLCurve と同じ求め方）、モード、重み
+function keySlopes(d,kind,c,j){const s=compSeries(d,kind,c),o=s.tan[j];
+  const wOf=side=>{const S=SIDE[side],on=!!o&&(modeIs(o.weightedMode,'Both')||modeIs(o.weightedMode,S.wm));
+    return{on,w:o&&Number.isFinite(o[S.w])?M.clamp(o[S.w],0,1):1/3};};
+  return{in:PLCurve.resolveIn(d.t,s.v,s.tan,j),out:PLCurve.resolveOut(d.t,s.v,s.tan,j),
+    inMode:o?normMode(o.leftTangentMode):'Linear',outMode:o?normMode(o.rightTangentMode):'Linear',
+    inW:wOf('in'),outW:wOf('out'),obj:o,v:s.v[j]};}
+// キー k の成分 c の接線オブジェクト。create なら無ければ両側 Linear で作る
+function tanSlot(k,kind,c,create){
+  if(kind==='scalar'){if(isTanObj(k.tan))return k.tan;if(!create)return null;k.tan={leftTangentMode:'Linear',rightTangentMode:'Linear'};return k.tan;}
+  const n=TAN_DIM[kind];
+  if(!Array.isArray(k.tan)){if(!create)return null;k.tan=new Array(n).fill(null);}
+  if(isTanObj(k.tan[c]))return k.tan[c];if(!create)return null;
+  while(k.tan.length<n)k.tan.push(null);
+  return k.tan[c]={leftTangentMode:'Linear',rightTangentMode:'Linear'};}
+// 傾き m（表示の符号、値/秒）を書く。その側が Auto / ClampedAuto / Linear なら Free にする
+function setSlope(clip,ch,k,c,side,m){const d=chanData(clip,ch),j=keyIndex(d,k);if(j<0||!Number.isFinite(m))return;
+  const o=tanSlot(k,ch.kind,c,true),S=SIDE[side];o[S.val]=d.flip[j]?-m:m;
+  if(['Auto','ClampedAuto','Linear'].some(x=>modeIs(o[S.mode],x)))o[S.mode]='Free';}
+function setWeight(clip,ch,k,c,side,w){if(!Number.isFinite(w))return;const o=tanSlot(k,ch.kind,c,true);o[SIDE[side].w]=M.clamp(w,0,1);}
+// weightedMode を書く。重みを使い始める側に値が無ければ 1/3（重み無しと同じ形）を書く
+function setWeightedMode(clip,ch,k,c,wm){const o=tanSlot(k,ch.kind,c,true);
+  if(wm==='None')delete o.weightedMode;else o.weightedMode=wm;
+  ['in','out'].forEach(sd=>{const S=SIDE[sd];if((wm==='Both'||wm===S.wm)&&!Number.isFinite(o[S.w]))o[S.w]=1/3;});}
+// 入側／出側のモードを comps の成分に当てる。Free は今求まる傾きを書き（形を変えない）、Auto・ClampedAuto・Linear は保存値を消す
+function setMode(clip,ch,k,side,mode,comps){const d=chanData(clip,ch),j=keyIndex(d,k);if(j<0)return;const S=SIDE[side];
+  comps.forEach(c=>{if(mode==='Linear'&&!tanSlot(k,ch.kind,c,false))return;   // tan の無い成分はもともと線形
+    const m=keySlopes(d,ch.kind,c,j)[side],o=tanSlot(k,ch.kind,c,true);o[S.mode]=mode;
+    if(mode==='Free')o[S.val]=d.flip[j]?-m:m;else if(mode!=='Constant')delete o[S.val];});}
+function niceStep(span){const r=span/4,p=Math.pow(10,Math.floor(Math.log10(r))),n=r/p;return(n<1.5?1:n<3.5?2:n<7.5?5:10)*p;}
+function drawCurve(t,top,h){
+  const ch=curveChOf(t),kind=ch.kind,nc=TAN_DIM[kind],fps=tlFps(t),pps=fps*view.ppf;   // pps: 1 秒あたりの画素
+  const comp=(v,c)=>kind==='scalar'?+v:v[c],col=c=>nc===1?t.color:CURVE_COL[c];
+  ctx.save();ctx.beginPath();ctx.rect(0,top,W,h);ctx.clip();
+  const f0=Math.max(0,view.start),f1=view.start+W/view.ppf,st=2/view.ppf,samp=[];
+  for(let f=f0;f<=f1+st;f+=st)samp.push({f,v:t.sampleCh(ch,f)});
+  const keys=[];t.clips.forEach(c=>{if(hiddenClips.has(c))return;const d=chanData(c,ch);
+    d.rows.forEach((r,j)=>keys.push({clip:c,k:r.k,d,j,x:fx(d.t[j]*fps),v:d.v[j]}));});
+  const vis=keys.filter(e=>e.x>=-8&&e.x<=W+8);
+  let range=drag&&drag.track===t&&drag.range;   // ドラッグ中は縦の範囲を止める
+  if(!range){let lo=Infinity,hi=-Infinity;const add=v=>{for(let c=0;c<nc;c++){const y=comp(v,c);if(Number.isFinite(y)){if(y<lo)lo=y;if(y>hi)hi=y;}}};
+    samp.forEach(s=>add(s.v));vis.forEach(e=>add(e.v));
+    if(!(hi>=lo)){lo=-1;hi=1;}if(hi-lo<1e-6){lo-=0.5;hi+=0.5;}const mg=(hi-lo)*0.08;range={vmin:lo-mg,vmax:hi+mg};}
+  const ys=(h-2*CURVE_PAD)/(range.vmax-range.vmin),vy=v=>top+CURVE_PAD+(range.vmax-v)*ys;
+  // 目盛り
+  const gs=niceStep(range.vmax-range.vmin);ctx.font='9px '+getCSS('--mono');ctx.textBaseline='middle';
+  for(let g=Math.ceil(range.vmin/gs)*gs;g<=range.vmax;g+=gs){const y=Math.round(vy(g))+.5;
+    ctx.strokeStyle=Math.abs(g)<gs*1e-6?getCSS('--grid2'):getCSS('--grid');ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();
+    ctx.fillStyle=getCSS('--dim2');ctx.fillText(String(+g.toFixed(6)),4,y-6);}
+  // 線
+  ctx.lineWidth=1.3;
+  for(let c=0;c<nc;c++){ctx.strokeStyle=col(c);ctx.beginPath();
+    samp.forEach((s,i)=>{const x=fx(s.f),y=vy(comp(s.v,c));if(i)ctx.lineTo(x,y);else ctx.moveTo(x,y);});ctx.stroke();}
+  ctx.lineWidth=1;
+  // チャンネルと成分の名前
+  const names=kind==='scalar'?[ch.name]:kind==='quat'?['x','y','z','w']:['x','y','z'];
+  ctx.font='10px '+getCSS('--mono');ctx.fillStyle=getCSS('--dim');if(nc>1)ctx.fillText(ch.name,W-30-names.length*16,top+10);
+  names.forEach((n,c)=>{ctx.fillStyle=col(c);ctx.fillText(n,W-24-(names.length-c-1)*16,top+10);});
+  // キー
+  const sc=selComp(t,ch),dense=vis.length>W/6,geom={t,ch,kind,nc,range,ys,vy,pps,keys:dense?[]:vis,handles:[]};
+  if(!dense)vis.forEach(e=>{const on=keySelHas(e.clip,e.k.f);
+    for(let c=0;c<nc;c++){const y=vy(comp(e.v,c)),s=on&&c===sc?4:3;
+      ctx.fillStyle=on?(c===sc?getCSS('--sel'):'#fde68a'):col(c);ctx.fillRect(e.x-s,y-s,2*s,2*s);
+      ctx.strokeStyle='#0b0f17';ctx.strokeRect(e.x-s+.5,y-s+.5,2*s-1,2*s-1);}});
+  // 選んだキーの選んだ成分の接線ハンドル（重み無しは一定の長さ、重みありは制御点の位置）
+  if(!dense&&sel&&sel.type==='key'&&sel.clip.track===t){const e=vis.find(e=>e.clip===sel.clip&&e.k.f===sel.lf);
+    if(e){const s=keySlopes(e.d,kind,sc,e.j),kx=e.x,ky=vy(comp(e.v,sc)),n=e.d.t.length;
+      ['in','out'].forEach(side=>{const nb=side==='in'?e.j-1:e.j+1;if(nb<0||nb>=n)return;
+        if((side==='in'?s.inMode:s.outMode)==='Constant')return;
+        const seg=Math.abs(e.d.t[nb]-e.d.t[e.j]),wt=side==='in'?s.inW:s.outW,m=s[side],dir=side==='in'?-1:1;let hx,hy;
+        if(wt.on&&seg>0){const dt=dir*wt.w*seg;hx=kx+dt*pps;hy=ky-m*dt*ys;}
+        else{const dx=pps,dy=-m*ys,L=Math.hypot(dx,dy)||1;hx=kx+dir*dx/L*HANDLE_LEN;hy=ky+dir*dy/L*HANDLE_LEN;}
+        ctx.strokeStyle=getCSS('--sel');ctx.beginPath();ctx.moveTo(kx,ky);ctx.lineTo(hx,hy);ctx.stroke();
+        ctx.beginPath();ctx.arc(hx,hy,4,0,Math.PI*2);ctx.fillStyle=wt.on?getCSS('--sel'):'#0b0f17';ctx.fill();ctx.stroke();
+        geom.handles.push({side,x:hx,y:hy,kx,ky,clip:e.clip,k:e.k,comp:sc,seg,wOn:wt.on});});}}
+  CURVE_GEOM.set(t.id,geom);ctx.restore();}
+// 値カーブ上の当たり：接線ハンドル → キーの点
+function curveHit(t,x,y){const g=CURVE_GEOM.get(t.id);if(!g)return null;
+  for(const hd of g.handles)if(Math.hypot(hd.x-x,hd.y-y)<7)return{handle:hd,g};
+  let best=null,bd=7;
+  g.keys.forEach(e=>{for(let c=0;c<g.nc;c++){const v=g.kind==='scalar'?+e.v:e.v[c],dd=Math.hypot(e.x-x,g.vy(v)-y);if(dd<bd){bd=dd;best={key:e,comp:c,g};}}});
+  return best;}
 function drawPlayhead(){const x=fx(playhead);if(x<-2||x>W+2)return;
   ctx.strokeStyle=getCSS('--amber');ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x+.5,0);ctx.lineTo(x+.5,H);ctx.stroke();
   ctx.fillStyle=getCSS('--amber');ctx.beginPath();ctx.moveTo(x-5,0);ctx.lineTo(x+6,0);ctx.lineTo(x+.5,9);ctx.closePath();ctx.fill();}
@@ -765,9 +965,14 @@ function trackHeadEl(t,h){
     <div class="twist">${t.expanded?'▾':'▸'}</div>
     <div class="act" title="アクティブ（複数可・キー打ち/クリップ作成の対象）">${pinned?'◉':(isActive(t)?'◯':'·')}</div>
     <div class="nm"><div class="t">${esc(t.name)}</div>
-      <div class="ty">${TRACK_DEF[t.type].label} · ${t.clips.length}clip${t.uname?` · <span style="color:#7dd3fc" title="正規名(uname)">⟶${esc(t.uname)}</span>`:''}</div></div>
+      <div class="ty">${TRACK_DEF[t.type].label} · ${t.clips.length}clip${t.uname?` · <span style="color:#7dd3fc" title="正規名(uname)">⟶${esc(t.uname)}</span>`:''}</div>
+      ${t.expanded&&t.view==='curve'&&t.channels.length>1?`<select class="chsel" title="値カーブに出すチャンネル">${t.channels.map(ch=>
+        `<option value="${ch.name}"${ch===curveChOf(t)?' selected':''}>${ch.name}${hasKeys(t,ch)?'':'（キーなし）'}</option>`).join('')}</select>`:''}</div>
+    <div class="cvb${t.view==='curve'?' on':''}" title="ドープシート／値カーブ（グラフエディタ）の切り替え">〰</div>
     <div class="gbtn" title="グループ">⊞</div><div class="del" title="トラック削除">✕</div>`;
   d.querySelector('.twist').onclick=()=>{t.expanded=!t.expanded;refresh();};
+  d.querySelector('.cvb').onclick=e=>{e.stopPropagation();t.view=t.view==='curve'?'dope':'curve';if(t.view==='curve')t.expanded=true;refresh();};
+  const chs=d.querySelector('.chsel');if(chs)chs.onchange=()=>{t.curveCh=chs.value;refresh();};
   d.querySelector('.act').onclick=e=>{e.stopPropagation();
     if(activeSet.has(t.id))activeSet.delete(t.id);else activeSet.add(t.id);refresh();};
   editable(d.querySelector('.nm .t'),()=>t.name,v=>t.name=v,()=>touch(t));
@@ -829,7 +1034,17 @@ cv.addEventListener('mousedown',e=>{
   if(r.kind==='group'){setPlayhead(xf(x));sel=null;marked=[];keySel=[];refresh();return;}
   const t=r.track,top=rowTopScreen(r);touch(t); // 最後に触ったトラック
   if(t.expanded&&y>=top+ROW_C){ // キーフレーム・レーン
-    for(const c of t.clips){if(hiddenClips.has(c))continue;for(const lf of c.keyFrames())
+    if(t.view==='curve'){const hit=curveHit(t,x,y);   // 値カーブ：接線ハンドル → キーの点 → 空きなら矩形選択
+      if(hit&&hit.handle&&!addMode&&!subMode){const hd=hit.handle,g=hit.g;
+        drag={mode:'tan',track:t,ch:g.ch,clip:hd.clip,k:hd.k,comp:hd.comp,side:hd.side,kx:hd.kx,ky:hd.ky,ys:g.ys,pps:g.pps,seg:hd.seg,wOn:hd.wOn,range:g.range};
+        refresh();return;}
+      if(hit&&hit.key){const e=hit.key,c=e.clip,lf=e.k.f;
+        keySel=addMode?keyUnion(keyBase,[{clip:c,lf}]):subMode?keySub(keyBase,[{clip:c,lf}]):[{clip:c,lf}];
+        marked=[];syncKeySel();curveSel={trackId:t.id,ch:hit.g.ch.name,comp:hit.comp};
+        if(!addMode&&!subMode){const g=hit.g;   // 横はフレーム、縦は値（回転以外）
+          drag={mode:'ckey',track:t,ch:g.ch,clip:c,lf,k:e.k,comp:hit.comp,oy:y,ov:g.kind==='scalar'?+e.v:e.v[hit.comp],ys:g.ys,range:g.range};}
+        refresh();return;}}
+    else for(const c of t.clips){if(hiddenClips.has(c))continue;for(const lf of c.keyFrames())
       if(Math.abs(fx(c.start+lf)-x)<6){
         keySel=addMode?keyUnion(keyBase,[{clip:c,lf}]):subMode?keySub(keyBase,[{clip:c,lf}]):[{clip:c,lf}];
         marked=[];syncKeySel();
@@ -863,9 +1078,22 @@ window.addEventListener('mousemove',e=>{if(!drag){hover(e);return;}
     if(nl>=1){drag.clip.start=ns;drag.clip.len=nl;}}
   else if(drag.mode==='key'){const moved=drag.clip.moveKey(drag.lf,Math.round(xf(x)-drag.clip.start));
     drag.lf=moved;keySel=[{clip:drag.clip,lf:moved}];if(sel&&sel.type==='key')sel.lf=moved;}
+  else if(drag.mode==='tan'){   // 接線ハンドル：傾き（重みのある側は横の長さで重みも）
+    let dx=x-drag.kx;dx=drag.side==='out'?Math.max(dx,1):Math.min(dx,-1);
+    const dt=dx/drag.pps;setSlope(drag.clip,drag.ch,drag.k,drag.comp,drag.side,((drag.ky-p.y)/drag.ys)/dt);
+    if(drag.wOn&&drag.seg>0)setWeight(drag.clip,drag.ch,drag.k,drag.comp,drag.side,M.clamp(Math.abs(dt)/drag.seg,0.01,1));
+    notifyEdit(drag.track.id,drag.clip.start+drag.k.f,drag.ch.name);}
+  else if(drag.mode==='ckey'){   // 値カーブのキー：横はフレーム、縦は値（回転は値を変えない。3px 動くまでは値を変えない）
+    const moved=drag.clip.moveKey(drag.lf,Math.round(xf(x)-drag.clip.start));
+    drag.lf=moved;keySel=[{clip:drag.clip,lf:moved}];if(sel&&sel.type==='key')sel.lf=moved;
+    if(drag.ch.kind!=='quat'){if(!drag.vOn&&Math.abs(drag.oy-p.y)>3)drag.vOn=true;
+      if(drag.vOn){const nv=drag.ov+(drag.oy-p.y)/drag.ys;
+        if(drag.ch.kind==='scalar')drag.k.v=nv;else{const a=drag.k.v.slice();a[drag.comp]=nv;drag.k.v=a;}}}
+    notifyEdit(drag.track.id,drag.clip.start+moved,drag.ch.name);}
   refresh();
 });
-window.addEventListener('mouseup',()=>{if(drag&&drag.clip)drag.clip.track.clips.sort((a,b)=>a.start-b.start);
+// ドラッグの終わりだけ refresh する（ドラッグでないときに refresh するとインスペクタが作り直され、チェックボックス等のクリックが失われる）
+window.addEventListener('mouseup',()=>{if(!drag)return;if(drag.clip)drag.clip.track.clips.sort((a,b)=>a.start-b.start);
   if(drag&&drag.mode==='marquee')marquee=null;drag=null;refresh();});
 cv.addEventListener('contextmenu',e=>e.preventDefault()); // Ctrl+ドラッグ用
 // 空きクリップ・レーンをダブルクリック → 完全な空クリップを生成
@@ -1229,7 +1457,7 @@ function hover(e){const{x,y}=mpos(e);let cur='default';
   const r=rowAtY(y);
   if(y<RULER_H)cur='ew-resize';
   else if(r&&r.kind==='track'){const t=r.track,top=rowTopScreen(r);
-    if(t.expanded&&y>=top+ROW_C){for(const c of t.clips)for(const lf of c.keyFrames())if(Math.abs(fx(c.start+lf)-x)<6)cur='pointer';}
+    if(t.expanded&&y>=top+ROW_C){if(t.view==='curve'){if(curveHit(t,x,y))cur='pointer';}else for(const c of t.clips)for(const lf of c.keyFrames())if(Math.abs(fx(c.start+lf)-x)<6)cur='pointer';}
     else{const cy=top+(ROW_C-CLIP_H)/2;for(const c of t.clips){if(hiddenClips.has(c))continue;const cx=fx(c.start),cw=c.len*view.ppf;
       if(y<cy||y>cy+CLIP_H)continue;if(Math.abs(x-cx)<6||Math.abs(x-(cx+cw))<6)cur='ew-resize';else if(x>=cx&&x<=cx+cw)cur='grab';}}}
   cv.style.cursor=cur;}
@@ -1278,12 +1506,20 @@ function renderInsp(){const el=document.getElementById('insp'),tag=document.getE
     el.innerHTML=`<div class="hint">${marked.length}個を選択中（縦に束ねられます）。</div>
       <div class="ibtns"><button id="m_bundle">バンドル化</button><button id="m_clear">選択解除</button></div>`;
     i('m_bundle','click',doBundle);i('m_clear','click',()=>{marked=[];refresh();});return;}
-  if(!sel){tag.textContent='';el.innerHTML='<div class="hint">クリップ（棒）を選ぶとパッケージを編集できます。トラック左の ▸ で展開するとドープシートが開きキーフレームを編集できます。<br><br>Shift+クリックで複数のクリップ／バンドルを選び「バンドル化」で縦にまとめられます（入れ子も可）。バンドルは上部タブを掴んで一括移動。<br><br><b>アクティブtrack</b>: ヘッダの ◉ で指定（複数可。未指定なら最後に触ったトラック）。<b>K</b>＝アクティブtrackにキー打ち（クリップ無ければ自動生成）、<b>C</b>＝空クリップ、空きレーンの<b>ダブルクリック</b>でも空クリップを作成。<br><br>トラック名／グループ名はクリックで変更。</div>';return;}
+  if(!sel){tag.textContent='';el.innerHTML='<div class="hint">クリップ（棒）を選ぶとパッケージを編集できます。トラック左の ▸ で展開するとドープシートが開きキーフレームを編集できます。<br><br><b>〰</b>（トラックのヘッダ）でドープシートと値カーブ（グラフエディタ）を切り替えます。値カーブではキーの点を横へ動かすとフレーム、縦へ動かすと値（回転以外）、選んだキーの接線ハンドルを動かすと傾き（重みのある側は重みも）が変わります。接線のモード・傾き・重みはキーのインスペクタでも変えられます。<br><br>Shift+クリックで複数のクリップ／バンドルを選び「バンドル化」で縦にまとめられます（入れ子も可）。バンドルは上部タブを掴んで一括移動。<br><br>バンドルのインスペクタで「レイヤー」にすると、中のクリップがレイヤーになり、どのレイヤーにも属さないクリップ（基底）の上に重なります（方式 override／additive・重み・ミュート・ソロ・重ねる順）。入れ子のレイヤーは重みが親と掛け合わされ、親のミュートで子もミュート、ソロは同じ親の兄弟レイヤーをミュートします。<br><br>選んだクリップ・キーの骨（無ければアクティブtrack）の軌跡がボーン編集に出ます（大きい点はキーのあるフレーム）。元に戻す／やり直すの後は選択が解除されるので選び直します。<br><br><b>アクティブtrack</b>: ヘッダの ◉ で指定（複数可。未指定なら最後に触ったトラック）。<b>K</b>＝アクティブtrackにキー打ち（クリップ無ければ自動生成）、<b>C</b>＝空クリップ、空きレーンの<b>ダブルクリック</b>でも空クリップを作成。<br><br>トラック名／グループ名はクリックで変更。</div>';return;}
   if(sel.type==='bundle'){const b=sel.bundle,bd=bBounds(b)||{start:0,end:0};tag.textContent='BUNDLE';
     el.innerHTML=`
       <div class="row"><label>名前</label><input type="text" id="b_nm" value="${esc(b.name)}"></div>
       <div class="row"><label>開始 f</label><input type="number" id="b_st" value="${bd.start}"></div>
       <div class="hint">範囲 ${bd.start} – ${bd.end} f / クリップ ${bAllClips(b).length} ・ 子バンドル ${b.childIds.length}</div>
+      <div class="row"><label>レイヤー</label><input type="checkbox" id="b_ly" ${b.layer?'checked':''}>
+        <span class="hint" style="flex:1">中のクリップを基底の上に重ねる</span></div>
+      ${b.layer?`<div class="row"><label>方式</label><select id="b_lm"><option value="override" ${b.layer.mode==='override'?'selected':''}>override（置き換え）</option><option value="additive" ${b.layer.mode==='additive'?'selected':''}>additive（加算）</option></select></div>
+      <div class="row"><label>重み</label><input type="range" id="b_lw" min="0" max="1" step="0.01" value="${b.layer.weight}">
+        <span class="v" id="b_lwv">${b.layer.weight.toFixed(2)}</span></div>
+      <div class="row"><label>ミュート</label><input type="checkbox" id="b_lmu" ${b.layer.mute?'checked':''}>
+        <label style="margin-left:10px">ソロ</label><input type="checkbox" id="b_lso" ${b.layer.solo?'checked':''}></div>
+      <div class="ibtns"><button id="b_lup" ${layerSwapTarget(b,-1)?'':'disabled'}>↑ 先に重ねる</button><button id="b_ldn" ${layerSwapTarget(b,1)?'':'disabled'}>↓ 後に重ねる</button></div>`:''}
       <div class="ibtns">
         <button id="b_col">${b.collapsed?'展開':'折りたたみ'}</button>
         <button id="b_cp">コピー</button><button id="b_ps">ペースト</button></div>
@@ -1291,6 +1527,16 @@ function renderInsp(){const el=document.getElementById('insp'),tag=document.getE
         <button id="b_ung">解除（中身は残す）</button><button id="b_del">中身ごと削除</button></div>`;
     i('b_nm','input',v=>{b.name=v.target.value;draw();});
     i('b_st','change',v=>{bSetStart(b,+v.target.value|0);refresh();});
+    // レイヤーの設定は dataSignature に入らないので、変えたら姿勢を送り直す
+    i('b_ly','change',v=>{b.layer=v.target.checked?normLayer({}):null;refresh();sendPose();});
+    if(b.layer){
+      i('b_lm','change',v=>{b.layer.mode=v.target.value==='additive'?'additive':'override';refresh();sendPose();});
+      i('b_lw','input',v=>{b.layer.weight=M.clamp(+v.target.value,0,1);document.getElementById('b_lwv').textContent=b.layer.weight.toFixed(2);draw();renderPose();sendPose();});
+      i('b_lw','change',()=>refresh());
+      i('b_lmu','change',v=>{b.layer.mute=v.target.checked;refresh();sendPose();});
+      i('b_lso','change',v=>{b.layer.solo=v.target.checked;refresh();sendPose();});
+      i('b_lup','click',()=>{layerSwap(b,-1);refresh();sendPose();});
+      i('b_ldn','click',()=>{layerSwap(b,1);refresh();sendPose();});}
     i('b_col','click',()=>{b.collapsed=!b.collapsed;refresh();});
     i('b_cp','click',()=>copyBundle(b));
     i('b_ps','click',pasteAny);
@@ -1300,8 +1546,16 @@ function renderInsp(){const el=document.getElementById('insp'),tag=document.getE
   if(sel.type==='keyset'){tag.textContent='KEYS '+keySel.length;
     const ntr=new Set(keySel.map(k=>{const t=tl.trackOfClip(k.clip);return t&&t.id;})).size;
     el.innerHTML=`<div class="hint">${keySel.length}キーを選択中（${ntr}トラック）。<br>矩形ドラッグで <b>Shift＝追加</b> / <b>Ctrl(Cmd)＝除外</b>。<br>コピー後、<b>⚙ペースト設定</b>で方式（新規/マージ）・配置（playhead/絶対）・<b>軸反転</b>・<b>貼り付け先トラック</b>を指定して貼り付けます。</div>
-      <div class="ibtns"><button id="ks_cp">コピー</button><button id="ks_ps">ペースト</button><button id="ks_del">選択キー削除</button></div>`;
+      <div class="ibtns"><button id="ks_cp">コピー</button><button id="ks_ps">ペースト</button><button id="ks_del">選択キー削除</button></div>
+      <div class="tanbox"><div class="hint">接線のモードを選んだ全キーの全チャンネル・全成分に当てる</div>
+        <div class="row"><label>入側</label><select id="ks_lm"><option value="">（変えない）</option>${TAN_MODES.map(m=>`<option value="${m}">${TAN_MODE_LABEL[m]}</option>`).join('')}</select></div>
+        <div class="row"><label>出側</label><select id="ks_rm"><option value="">（変えない）</option>${TAN_MODES.map(m=>`<option value="${m}">${TAN_MODE_LABEL[m]}</option>`).join('')}</select></div></div>`;
     i('ks_cp','click',copyKeys);i('ks_ps','click',pasteAny);
+    const ksMode=side=>ev=>{const mode=ev.target.value;if(!mode)return;
+      keySel.forEach(({clip,lf})=>clip.track.channels.forEach(ch=>{const kf=(clip.keys[ch.name]||[]).find(k=>k.f===lf);
+        if(kf){setMode(clip,ch,kf,side,mode,allComps(ch));notifyEdit(clip.track.id,clip.start+lf,ch.name);}}));
+      refresh();};
+    i('ks_lm','change',ksMode('in'));i('ks_rm','change',ksMode('out'));
     i('ks_del','click',()=>{keySel.forEach(k=>k.clip.removeKeyAt(k.lf));keySel=[];sel=null;refresh();});
     return;}
   if(sel.type==='clip'){const c=sel.clip;tag.textContent='CLIP';
@@ -1337,7 +1591,7 @@ function renderInsp(){const el=document.getElementById('insp'),tag=document.getE
       }else if(ch.kind==='vec3'){const v=kf.v.map(n=>(+n).toFixed(2));
         html+=`<div class="triplet"><input data-ch="${ch.name}" data-i="0" value="${v[0]}"><input data-ch="${ch.name}" data-i="1" value="${v[1]}"><input data-ch="${ch.name}" data-i="2" value="${v[2]}"></div>`;
       }else{html+=`<div class="row"><input type="range" data-ch="${ch.name}" data-s="1" min="0" max="1" step="0.01" value="${kf.v}" style="flex:1"><span class="v">${(+kf.v).toFixed(2)}</span></div>`;}
-      html+='</div>';});
+      html+=tanHtml(c,ch,kf)+'</div>';});
     html+=`<div class="ibtns"><button id="k_cp">コピー</button><button id="k_del">このキーを削除</button></div>`;el.innerHTML=html;
     i('k_cp','click',copyKeys);
     i('k_f','change',v=>{sel.lf=c.moveKey(lf,+v.target.value|0);refresh();});
@@ -1350,8 +1604,35 @@ function renderInsp(){const el=document.getElementById('insp'),tag=document.getE
       else{kf.v=+inp.value;inp.nextElementSibling.textContent=(+inp.value).toFixed(2);}
       const tt=tl.trackOfClip(c);notifyEdit(tt&&tt.id,c.start+lf,ch);
       draw();renderPose();}));
+    el.querySelectorAll('[data-tch]').forEach(inp=>inp.addEventListener('change',()=>{   // 接線（キーの tan に書く）
+      const ch=c.track.channels.find(x=>x.name===inp.dataset.tch),kf=ch&&c.keys[ch.name].find(k=>k.f===lf);if(!kf)return;
+      const tt=c.track,comp=selComp(tt,ch),key=inp.dataset.tk,val=inp.value;
+      if(key==='comp'){curveSel={trackId:tt.id,ch:ch.name,comp:+val};refresh();return;}
+      if(key==='lm'||key==='rm')setMode(c,ch,kf,key==='lm'?'in':'out',val,allComps(ch));
+      else if(key==='in'||key==='out'){if(val===''||!Number.isFinite(+val))return;setSlope(c,ch,kf,comp,key,+val);}
+      else if(key==='wm')setWeightedMode(c,ch,kf,comp,val);
+      else if(key==='iw'||key==='ow'){if(val===''||!Number.isFinite(+val))return;setWeight(c,ch,kf,comp,key==='iw'?'in':'out',+val);}
+      notifyEdit(tt.id,c.start+lf,ch.name);refresh();}));
     i('k_del','click',()=>{c.removeKeyAt(lf);sel=null;refresh();});
   }}
+// キーのインスペクタの接線の欄。モードはチャンネルの全成分、傾き・重みは選んだ成分。空欄はモードから求まる値（薄字）を使う
+function tanHtml(c,ch,kf){const kind=ch.kind,n=TAN_DIM[kind],comp=selComp(c.track,ch),d=chanData(c,ch),j=keyIndex(d,kf);if(j<0)return'';
+  const s=keySlopes(d,kind,comp,j),o=s.obj,names=kind==='quat'?['x','y','z','w']:['x','y','z'];
+  const fmt=x=>Number.isFinite(x)?String(+x.toFixed(5)):'';
+  const sel_=(key,opts,cur)=>`<select data-tch="${ch.name}" data-tk="${key}">${opts.map(([v,l])=>`<option value="${v}"${v===cur?' selected':''}>${l}</option>`).join('')}</select>`;
+  const num=(key,val,ph)=>`<input type="number" step="any" data-tch="${ch.name}" data-tk="${key}" value="${val}" placeholder="${ph}">`;
+  const modes=TAN_MODES.map(m=>[m,TAN_MODE_LABEL[m]]);
+  const slopeVal=S=>o&&Number.isFinite(o[S.val])?fmt(d.flip[j]?-o[S.val]:o[S.val]):'';
+  const wVal=S=>o&&Number.isFinite(o[S.w])?fmt(o[S.w]):'';
+  const wm=(o&&['In','Out','Both'].find(x=>modeIs(o.weightedMode,x)))||'None';
+  let h=`<div class="tanbox"><div class="cl" style="color:var(--dim)">接線${n>1?'（モードは全成分）':''}</div>`;
+  if(n>1)h+=`<div class="row"><label>成分</label>${sel_('comp',names.map((x,i)=>[String(i),x]),String(comp))}</div>`;
+  h+=`<div class="row"><label>モード 入</label>${sel_('lm',modes,s.inMode)}</div>`;
+  h+=`<div class="row"><label>モード 出</label>${sel_('rm',modes,s.outMode)}</div>`;
+  h+=`<div class="row"><label>傾き 入/出</label>${num('in',slopeVal(SIDE.in),fmt(s.in))}${num('out',slopeVal(SIDE.out),fmt(s.out))}</div>`;
+  h+=`<div class="row"><label>重み方式</label>${sel_('wm',['None','In','Out','Both'].map(x=>[x,x]),wm)}</div>`;
+  h+=`<div class="row"><label>重み 入/出</label>${num('iw',wVal(SIDE.in),fmt(s.inW.w))}${num('ow',wVal(SIDE.out),fmt(s.outW.w))}</div>`;
+  return h+'</div>';}
 function i(id,ev,fn){const e=document.getElementById(id);if(e)e.addEventListener(ev,fn);}
 
 /* ---- コピー & ペースト ---- */
@@ -1456,7 +1737,8 @@ function refresh(){normalizeOrder();pruneBundles();layoutRows();scrollY=M.clamp(
   renderHeads();draw();renderInsp();renderPose();updatePasteBtn();
   document.getElementById('totF').textContent=tl.length;document.getElementById('fpsR').textContent=tl.fps;syncPlay();
   emitState();
-  if(window.tlUndo)window.tlUndo.commit();}   // 操作の終わり。変わっていれば Undo を 1 件積む（ドラッグ中などは積まない）
+  if(window.tlUndo)window.tlUndo.commit();   // 操作の終わり。変わっていれば Undo を 1 件積む（ドラッグ中などは積まない）
+  pathUpdate();}                              // 軌跡：版か対象が変わっていれば送り直す
 
 document.getElementById('play').onclick=function(){playing=!playing;this.textContent=playing?'⏸':'▶';
   this.classList.toggle('pri',!playing);if(playing){last=0;requestAnimationFrame(loop);}};
@@ -1569,6 +1851,7 @@ function onWsMessage(m){
       let ids=Array.isArray(m.ids)?m.ids.slice():[];
       if(Array.isArray(m.names)){const byCanon=m.names.map(n=>{const t=trackByCanon(poseNameToCanon(n));return t&&t.id;}).filter(Boolean);if(byCanon.length)ids=byCanon;}
       if(ids.length)window.tlSync.selectBones(ids);}}
+  else if(m.type==='pathRequest'){pathVer=-1;pathTargetSent=undefined;pathUpdate();}   // ボーン編集の起動：軌跡を送り直す
   else if(m.type==='undoGroup'){                                     // ボーン編集のスライダー操作 → 間の書き込みを Undo 1 件に
     if(m.phase==='begin')window.tlUndo.suspendRecording();else if(m.phase==='end')window.tlUndo.resumeRecording();}
   else if(m.type==='pose'){applyRemotePose(m.bones);}                // 関節角 → 現在フレームにキー(アンカー)書込
@@ -1617,22 +1900,68 @@ function applyRemotePose(bones){
   refresh(); _src='local';
 }
 // 現在フレームの各ボーンの局所回転を送出（→ bone_quat 等へ）。キーは正規名(Unity英名)。
+// 骨はボーントラック（bakedBones など）だけから送る。Hips の pos は正規化した差（÷ レストの腰の高さ）なので
+// ボーン編集の内蔵骨格の腰の高さ REST_HIPS_Y を掛ける。マッスルトラックは骨に直さない（直せるのは PolyLing だけ）。
+// sendPose と軌跡（pathData）がこれを使う。ph は整数フレーム
+function poseTracks(){return tl.tracks.filter(t=>t.type==='bone'&&t.clips.length&&!isAuxTrack(t));}
+function poseBones(ph,tracks){const out={};
+  (tracks||poseTracks()).forEach(t=>{const p=t.sample(ph);if(p&&p.rot){const o={rot:p.rot};if(p.pos)o.pos=canon(t)==='Hips'?p.pos.map(v=>v*REST_HIPS_Y):p.pos;out[canon(t)]=o;}});
+  return out;}
 function sendPose(){
-  if((!ws||ws.readyState!==1)&&window.parent===window)return; const ph=Math.round(playhead),out={};
-  // 骨はボーントラック（bakedBones など）だけから送る。Hips の pos は正規化した差（÷ レストの腰の高さ）なので
-  // ボーン編集の内蔵骨格の腰の高さ REST_HIPS_Y を掛ける。マッスルトラックは骨に直さない（直せるのは PolyLing だけ）。
-  tl.tracks.forEach(t=>{if(t.type!=='bone'||!t.clips.length||isAuxTrack(t))return;
-    const p=t.sample(ph);if(p&&p.rot){const o={rot:p.rot};if(p.pos)o.pos=canon(t)==='Hips'?p.pos.map(v=>v*REST_HIPS_Y):p.pos;out[canon(t)]=o;}});
+  if((!ws||ws.readyState!==1)&&window.parent===window)return; const ph=Math.round(playhead),out=poseBones(ph);
+  // 表情：表情トラックの値をトラック名のまま送る（VRM の表情名への引き当ては受け手 vrm_viewer.html が VRMA 書き出しと同じ規則で行う）
+  const expressions=[];
+  tl.tracks.forEach(t=>{if(t.type!=='morph'||!t.clips.length)return;
+    const p=t.sample(ph);if(p&&typeof p.w==='number'&&Number.isFinite(p.w))expressions.push({name:String(t.name||t.id),provider:t.plProvider||null,w:p.w});});
   const msg={type:'pose',bones:out,frame:ph};
+  if(expressions.length)msg.expressions=expressions;
   if(!Object.keys(out).length&&tl.tracks.some(t=>t.type==='muscle'&&t.clips.length)&&!_warnedNoBaked){
     _warnedNoBaked=true;toast('マッスルだけで骨（bakedBones）がありません。PolyLing で .plmotion を書き直すと bakedBones が付き、姿勢を表示できます');}
   // 新しいモーションを読み込んだ直後は、受け手の姿勢をいったん T ポーズに戻させる（前のモーションの骨が残らないように）
   if(_poseResetNext){msg.reset=true;_poseResetNext=false;}
-  if(Object.keys(out).length||msg.reset)wsSend(msg);
+  if(Object.keys(out).length||expressions.length||msg.reset)wsSend(msg);
 }
 const REST_HIPS_Y=1.0;       // ボーン編集の内蔵骨格の腰の高さ（bone_editor.html の BONES の Hips）
 let _poseResetNext=false;    // 次の sendPose で reset を付ける
 let _warnedNoBaked=false;    // 「bakedBones が無い」を読込ごとに 1 回だけ出す
+/* ===== モーションパス（軌跡）=====
+   ボーン編集（bone_editor.html）に、選んだ骨の軌跡を描かせるためのデータを送る。
+   ・対象：タイムラインの選択（selectedBoneIds）の最初の骨トラック（poseTracks に入るもの）。無ければ null（描かない）
+   ・{type:'pathData', start, poses:[poseBones(f) …], keys:{骨名:[キーのフレーム]}, bone}
+       start〜最終フレーム（plMaxFrame と同じ式）の整数フレームごとの姿勢。sendPose と同じ poseBones で求めるので、
+       各点はそのフレームで sendPose を送ったときにボーン編集が当てる姿勢と同じ。
+       小数のフレームは使わない（sendPose が整数フレーム Math.round(playhead) だけを送るため）。
+       キーのフレーム＝そのトラックの全クリップ（基底・レイヤーとも）・全チャンネルの start+k.f（ループの繰り返しは含めない）
+   ・データの版は tlUndo.ver（控えが変わるたびに増える。キー・クリップ・レイヤーの設定の変更、元に戻す／やり直す、読込）。
+     変わったら計算し直す。長いモーションでは時間がかかるので 12 ms ずつ区切って計算し、途中で版が変わればやり直す
+   ・対象だけ変わったときは計算し直さず {type:'pathTarget', bone} を送る
+   ・呼ぶのは refresh の末尾（選択の変更もここを通る）・restore と clearHistory の後。送り先は pathSink（外側への postMessage。WebSocket には流さない）
+   ・最後の計算の時間は window.tlPathStats */
+let pathSink=null,pathVer=-1,pathJob=null,pathTargetSent;
+window.tlPathStats=null;
+function pathTargetName(){const t=selectedBoneIds().map(id=>tl.tracks.find(x=>x.id===id)).find(t=>t&&t.type==='bone'&&t.clips.length&&!isAuxTrack(t));return t?canon(t):null;}
+function pathKeys(){const k={};
+  poseTracks().forEach(t=>{const s=new Set();t.clips.forEach(c=>Object.values(c.keys).forEach(a=>(a||[]).forEach(kk=>s.add(Math.round(c.start+kk.f)))));
+    k[canon(t)]=[...s].sort((a,b)=>a-b);});
+  return k;}
+function pathUpdate(){
+  if(!pathSink||!window.tlUndo)return;
+  const bone=pathTargetName(),ver=window.tlUndo.ver;
+  if(ver===pathVer){if(bone!==pathTargetSent){pathTargetSent=bone;pathSink({type:'pathTarget',bone});}return;}
+  if(pathJob&&pathJob.ver===ver)return;                               // 同じ版を計算中（終わったときの対象を送る）
+  if(pathJob)clearTimeout(pathJob.timer);
+  let maxF=0;tl.tracks.forEach(t=>t.clips.forEach(c=>maxF=Math.max(maxF,c.start+Math.max(0,c.len-1))));
+  const job={ver,f:0,maxF,tracks:poseTracks(),poses:[],ms:0,t0:performance.now(),timer:0};pathJob=job;
+  const step=()=>{if(pathJob!==job)return;
+    if(window.tlUndo.ver!==job.ver){pathJob=null;pathUpdate();return;}  // 計算中に変わった。やり直す
+    const a=performance.now();
+    while(job.f<=job.maxF){job.poses.push(poseBones(job.f,job.tracks));job.f++;if(performance.now()-a>12)break;}
+    job.ms+=performance.now()-a;
+    if(job.f<=job.maxF){job.timer=setTimeout(step,0);return;}
+    pathJob=null;pathVer=job.ver;const b=pathTargetName();pathTargetSent=b;
+    window.tlPathStats={frames:job.poses.length,tracks:job.tracks.length,computeMs:job.ms,wallMs:performance.now()-job.t0};
+    pathSink({type:'pathData',start:0,poses:job.poses,keys:pathKeys(),bone:b});};
+  job.timer=setTimeout(step,0);}
 // REC: 受信frameに含まれるボーン/モーフへライブ追記（1フレーム=1キー）
 function ensureRecTrack(name,type){return tl.tracks.find(t=>t.type===type&&t.name===name)||tl.addTrack({name,type,color:pickCol()});}
 function recStart(){rec={on:true,idx:0,clips:{},start:Math.round(playhead)};toast('REC 開始（受信フレームを記録）');}
@@ -1708,7 +2037,9 @@ window.addEventListener('keydown',e=>{
    ・TimelineUndoController … 操作の終わり（refresh の末尾）で commit し、前回の控えと違えば 1 件積む。
      次の間は積まない：キャンバスのドラッグ中（drag）、REC 中（rec.on）、一時停止中（suspendRecording）。
      終わった時点の commit で 1 件にまとまる（PolyLing の SuspendRecording / ResumeRecording 相当）。
-   ・トラック・グループ・バンドルの開閉は控えから外す。戻すときは今の開閉を保つ。
+   ・トラック・グループ・バンドルの開閉と、トラックの表示（ドープシート／値カーブ、カーブのチャンネル）は控えから外す。戻すときは今の値を保つ。
+   ・接線の編集はキーの tan を書き換えるので、ほかの編集と同じく控えの差として積まれる。
+   ・バンドルのレイヤーの設定（layer）は Bundle.toJSON に入るので、控えの差として積まれる。
    ・Undo 後は選択を解除する。 */
 class TimelineSnapshotRecord{
   constructor(before,after){this.before=before;this.after=after;}
@@ -1719,42 +2050,43 @@ class TimelineUndoController{
   constructor(){
     this.onChanged=null;                                              // 履歴が変わったとき（外側のボタン表示の更新）
     this.stack=new PolyLingUndo.UndoStack({maxSize:50,onChanged:()=>{if(this.onChanged)this.onChanged();}});
-    this._base=null;this._suspend=0;this._restoring=false;}
+    this._base=null;this._suspend=0;this._restoring=false;
+    this.ver=0;}                                                      // 控え（_base）が変わるたびに増える版（モーションパスが使う）
   get canUndo(){return this.stack.canUndo;}
   get canRedo(){return this.stack.canRedo;}
   snapshot(){const o=tl.toJSON();
-    o.tracks.forEach(t=>{delete t.expanded;});o.groups.forEach(g=>{delete g.collapsed;});o.bundles.forEach(b=>{delete b.collapsed;});
+    o.tracks.forEach(t=>{delete t.expanded;delete t.view;delete t.curveCh;});o.groups.forEach(g=>{delete g.collapsed;});o.bundles.forEach(b=>{delete b.collapsed;});
     return JSON.stringify(o);}
   _busy(){return this._suspend>0||this._restoring||!!drag||rec.on;}
   /** 操作の終わり。前回の控えと違えば 1 件積む。 */
   commit(description){
     if(this._busy())return false;
     const now=this.snapshot();
-    if(this._base===null){this._base=now;return false;}
+    if(this._base===null){this._base=now;this.ver++;return false;}
     if(now===this._base)return false;
     this.stack.record(new TimelineSnapshotRecord(this._base,now),description||'編集');
-    this._base=now;return true;}
+    this._base=now;this.ver++;return true;}
   suspendRecording(){this._suspend++;}
   resumeRecording(){if(this._suspend>0)this._suspend--;if(!this._suspend)this.commit();}
   /** ファイル読込・モデルの変更。今の状態を起点にして履歴を消す。 */
-  clearHistory(){this._suspend=0;this._base=this.snapshot();this.stack.clear();}
+  clearHistory(){this._suspend=0;this._base=this.snapshot();this.ver++;this.stack.clear();pathUpdate();}
   undo(){if(this._busy())return false;this.commit();return this.stack.performUndo(this);}
   redo(){if(this._busy())return false;this.commit();return this.stack.performRedo(this);}
   /** 記録から呼ばれる。控えからタイムラインを作り直す。 */
   restore(json){
     const fold={};
-    tl.tracks.forEach(t=>{fold['t:'+t.id]=t.expanded;});tl.groups.forEach(g=>{fold['g:'+g.id]=g.collapsed;});tl.bundles.forEach(b=>{fold['b:'+b.id]=b.collapsed;});
+    tl.tracks.forEach(t=>{fold['t:'+t.id]=t.expanded;fold['v:'+t.id]=[t.view,t.curveCh];});tl.groups.forEach(g=>{fold['g:'+g.id]=g.collapsed;});tl.bundles.forEach(b=>{fold['b:'+b.id]=b.collapsed;});
     this._restoring=true;
     try{
       tl=MotionTimeline.fromJSON(JSON.parse(json));window.tl=tl;
-      tl.tracks.forEach(t=>{const v=fold['t:'+t.id];if(v!==undefined)t.expanded=v;});
+      tl.tracks.forEach(t=>{const v=fold['t:'+t.id];if(v!==undefined)t.expanded=v;const w=fold['v:'+t.id];if(w){t.view=w[0];t.curveCh=w[1];}});
       tl.groups.forEach(g=>{const v=fold['g:'+g.id];if(v!==undefined)g.collapsed=v;});
       tl.bundles.forEach(b=>{const v=fold['b:'+b.id];if(v!==undefined)b.collapsed=v;});
       sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;
       refresh();
     }finally{this._restoring=false;}
-    this._base=this.snapshot();
-    sendPose();}
+    this._base=this.snapshot();this.ver++;
+    sendPose();pathUpdate();}
 }
 window.tlUndo=new TimelineUndoController();
 
@@ -1768,7 +2100,9 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
 </style>
 <script>
 (() => {
-  /* ===== PolyLingMotion adapter（読込 v1〜v4、保存 v4。PolyLing_VRMA整備計画.md 2.2）=====
+  /* ===== PolyLingMotion adapter（読込 v1〜v5、保存 v5。PolyLing_VRMA整備計画.md 2.2・PolyLing_モーション編集構造計画.md 段 1）=====
+     v5 は平らなトラックに加えて編集の構造 edit（トラック・クリップ・バンドル・レイヤー）を書く。読込は edit があればそれから作り、
+     edit の当たらない平らなトラックは v4 と同じくトラックごとにクリップ 1 本で作る。
      PolyLingの時刻は秒、編集UIはフレーム。
      bakedBones（正準骨格上の Humanoid ローカル回転。Hips の pos は「レスト位置からの差 ÷ レストの腰の高さ」）が骨の正本。
      骨の表示と VRMA の書き出しは bakedBones だけから作る（マッスルから骨を解けるのは PolyLing だけ）。
@@ -1781,7 +2115,11 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
      muscles と body を書かない（食い違うため。PolyLing が読むときに bakedBones から焼き直す）。
      接線（tan / posTan / rotTan / sclTan）とラップモードは保持して書き戻す。
      キーの元の秒（t0）も保持し、キーが元のフレームにある間は t0 をそのまま書き出す。
-     接線の編集と、接線を使った再生評価は未対応（再生は位置/表情=線形、回転=Slerp）。 */
+     ただし、キーを持つクリップが 2 本以上か重み 1 未満のクリップがあるか、キーを持つクリップがレイヤー（layer を持つバンドル）に
+     属するトラック（plNeedsBake）は、キーのままでは再生と
+     一致しないので、再生の評価（Track.sample）をフレーム 0〜最終フレームで標本化して書く（接線・t0 なし、ラップ Clamp）。
+     再生は接線とラップモードを使って評価する（plmotion_curve.js。規則の正本は MotionCurveMath.cs）。
+     接線はグラフエディタ（値カーブ）とキーのインスペクタで編集し、キーの tan に書く。ここではそれをそのまま書き出す。 */
   const plClone=v=>v==null?v:JSON.parse(JSON.stringify(v));
   const plFinite=n=>Number.isFinite(+n);
   const plVec=(v,n)=>Array.isArray(v)&&v.length>=n&&v.slice(0,n).every(plFinite)?v.slice(0,n).map(Number):null;
@@ -1805,9 +2143,23 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
         if(s)plPut(c,'scl',f,s,Array.isArray(k.sclTan)?k.sclTan:null,k.t);
       }else if(plFinite(k.v))plPut(c,'w',f,+k.v,k.tan&&typeof k.tan==='object'?k.tan:null,k.t);
     });c._sort();return t;}
+  /* ---- 編集の構造 edit（version 5。PolyLing_外部連携の契約.md §5）----
+     edit.tracks のトラックは (role, targetKind, target) で平らなトラックに当たる。edit.bundles はバンドルとレイヤー。
+     時刻はフレーム。表示だけの欄（色・展開・表示の種類・グループ・畳み）は書かない。 */
+  const PL_ROLE_TYPE={bones:'bone',bakedBones:'bone',body:'bone',lookAt:'bone',expressions:'morph',muscles:'muscle'};
+  const plFlatKey=(role,kind,target)=>role+'\n'+(kind||'')+'\n'+target;
+  function plAddEditTrack(dst,et){const type=PL_ROLE_TYPE[et.role];if(!type)throw new Error(`edit のトラック ${et.id} の role "${et.role}" は読めません`);
+    const t=dst.addTrack({id:String(et.id),name:String(et.name!=null?et.name:et.target),type,color:pickCol(),uname:et.uname||null,
+      plRole:et.role,plTargetKind:et.targetKind||null,preWrapMode:et.preWrapMode||null,postWrapMode:et.postWrapMode||null,
+      plCategory:et.category||null,plProvider:et.provider||null});
+    (Array.isArray(et.clips)?et.clips:[]).forEach(c=>{const keys={};
+      t.channels.forEach(ch=>{const a=c[ch.name];if(Array.isArray(a))keys[ch.name]=a.map(k=>{
+        const y={f:+k.f,v:Array.isArray(k.v)?k.v.map(Number):+k.v};if(k.tan!=null)y.tan=k.tan;if(plFinite(k.t0))y.t0=+k.t0;return y;});});
+      t.addClip({id:String(c.id),name:c.name,start:+c.start||0,len:+c.len,loop:!!c.loop,weight:c.weight==null?1:+c.weight,keys});});
+    return t;}
   function importPolyLing(data,fileName,label){
     if(!data||data.format!=='PolyLingMotion')throw new Error('format が PolyLingMotion ではありません');
-    const ver=+data.version||1;if(ver!==1&&ver!==2&&ver!==3&&ver!==4)throw new Error('未対応のversion: '+data.version);
+    const ver=+data.version||1;if(![1,2,3,4,5].includes(ver))throw new Error('未対応のversion: '+data.version);
     const oldRoot=(Array.isArray(data.muscles)?data.muscles:[]).find(t=>t&&/^Root[TQ]\./.test(String(t.name||'')));
     if(oldRoot)throw new Error(`muscles に ${oldRoot.name} があります（腰は body トラックに入れる形式に変わりました。PolyLing の convertMotionRootToBody で変換してください）`);
     if(data.body&&(String(data.body.id||'')!=='body'||data.body.targetKind!=='body'))
@@ -1824,22 +2176,41 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
     // 秒→フレームの切り上げは float の誤差（34.0000032 など）で 1 フレーム伸びないよう、わずかな余裕を引く
     const len=Math.max(1,Math.ceil(maxT*fps-1e-4)+1),nm=String(data.name||fileName||'PolyLingMotion');
     const ofs=plVec(data.lookAtOffsetFromHeadBone,3);
-    const dst=new MotionTimeline({fps,plMotion:{format:'PolyLingMotion',version:4,name:nm,space:data.space||'local',loop:!!data.loop,
+    const dst=new MotionTimeline({fps,plMotion:{format:'PolyLingMotion',version:5,name:nm,space:data.space||'local',loop:!!data.loop,
       duration:maxT,metadata:plClone(data.metadata||null),
       absentMuscles:data.absentMuscles==='zero'||data.absentMuscles==='rest'?data.absentMuscles:null,
       lookAtOffsetFromHeadBone:ofs}});
-    (Array.isArray(data.bones)?data.bones:[]).forEach(x=>plAddTrack(dst,x,'bone','bones',fps,len,nm));
-    if(data.body)plAddTrack(dst,data.body,'bone','body',fps,len,nm);
-    if(look)plAddTrack(dst,Object.assign({},look,{id:'lookAt',targetKind:'lookAt'}),'bone','lookAt',fps,len,nm);
-    baked.forEach(x=>plAddTrack(dst,x,'bone','bakedBones',fps,len,nm));
-    expressions.forEach(x=>plAddTrack(dst,x,'morph','expressions',fps,len,nm));
-    (Array.isArray(data.muscles)?data.muscles:[]).forEach(x=>plAddTrack(dst,x,'muscle','muscles',fps,len,nm));
+    // version 5 の edit があれば、そのトラック（edit の順）とバンドルを作る。edit の当たらない平らなトラックはクリップ 1 本で後ろに足す
+    const edit=data.edit&&typeof data.edit==='object'?data.edit:null;
+    if(edit&&ver<5){notes.push(`v${ver} の edit は読みません`);}
+    // rotationSource が bakedBones のとき、muscles と body は bakedBones から作った派生（PolyLing の MotionClipDTO.BakedBonesArePrimary）。
+    // 本体と同じく派生のトラックは読まない（MotionEditOps.EnsureEdit は edit に足さない）。書き戻すと rotationSource の無いファイルで
+    // muscles が正本になり、本体が bakedBones を派生として扱う。保存は bakedBones だけになり、本体が読むときに作り直す。
+    const derivedMB=data.rotationSource==='bakedBones'&&baked.length>0;
+    if(derivedMB&&((Array.isArray(data.muscles)&&data.muscles.length)||data.body))notes.push('muscles と body は bakedBones から作った派生なので読みません（PolyLing が読むときに作り直します）');
+    const isDerivedRole=role=>derivedMB&&(role==='muscles'||role==='body');
+    const covered=new Set(),droppedClips=new Set();
+    if(edit&&ver>=5){(Array.isArray(edit.tracks)?edit.tracks:[]).forEach(et=>{if(!et)return;
+        if(isDerivedRole(et.role)){(Array.isArray(et.clips)?et.clips:[]).forEach(c=>{if(c)droppedClips.add(String(c.id));});return;}
+        plAddEditTrack(dst,et);covered.add(plFlatKey(et.role,et.targetKind,et.target));});
+      (Array.isArray(edit.bundles)?edit.bundles:[]).forEach(b=>{if(!b)return;dst.addBundle({id:String(b.id),name:b.name,color:PAL[(dst.bundles.length+2)%PAL.length],
+        clipIds:Array.isArray(b.clipIds)?b.clipIds.map(String).filter(id=>!droppedClips.has(id)):[],childIds:Array.isArray(b.childIds)?b.childIds.map(String):[],
+        parentId:b.parentId!=null?String(b.parentId):null,layer:b.layer||null});});
+      bumpUid(dst);}   // 後で足すトラック・クリップの id が edit の id と重ならないように
+    const flat=(x,role,kind,target)=>!covered.has(plFlatKey(role,kind,target));
+    (Array.isArray(data.bones)?data.bones:[]).forEach(x=>{if(x&&flat(x,'bones',x.targetKind||'path',x.id))plAddTrack(dst,x,'bone','bones',fps,len,nm);});
+    if(data.body&&!derivedMB&&flat(data.body,'body','body','body'))plAddTrack(dst,data.body,'bone','body',fps,len,nm);
+    if(look&&flat(look,'lookAt','lookAt','lookAt'))plAddTrack(dst,Object.assign({},look,{id:'lookAt',targetKind:'lookAt'}),'bone','lookAt',fps,len,nm);
+    baked.forEach(x=>{if(x&&flat(x,'bakedBones','humanoid',x.id))plAddTrack(dst,x,'bone','bakedBones',fps,len,nm);});
+    expressions.forEach(x=>{if(x&&(x.path||flat(x,'expressions',null,x.name)))plAddTrack(dst,x,'morph','expressions',fps,len,nm);});
+    if(!derivedMB)(Array.isArray(data.muscles)?data.muscles:[]).forEach(x=>{if(x&&flat(x,'muscles',null,x.name))plAddTrack(dst,x,'muscle','muscles',fps,len,nm);});
+    bumpUid(dst);
     tl=dst;window.tl=tl;motionSpace=data.space||'local';_retargetBackup=null;_poseResetNext=true;_warnedNoBaked=false;
     tl.plMotion.bakedSig=plBakedSig();   // 保存時に「bakedBones を変えたか」を見るための控え
     sel=null;marked=[];keySel=[];activeSet=new Set();lastTrack=null;playhead=0;scrollY=0;view.start=0;refresh();notifyFrame();emitState();sendPose();
     const n=tl.tracks.length,tan=plHasTangents(data);
     window.tlUndo.clearHistory();   // ファイル読込。履歴を消す
-    toast(`${label||'PolyLing v'+ver} 読込: ${n}トラック / ${fps}fps${tan?'（接線は保持・再生は線形）':''}${notes.length?' / '+notes.join(' / '):''}`);return n;
+    toast(`${label||'PolyLing v'+ver} 読込: ${n}トラック / ${fps}fps${tan?'（接線あり）':''}${notes.length?' / '+notes.join(' / '):''}`);return n;
   }
   function plKeyMap(t,fps){const map=new Map();
     [...t.clips].sort((a,b)=>a.start-b.start).forEach(c=>t.channels.forEach(ch=>(c.keys[ch.name]||[]).forEach(k=>{
@@ -1853,47 +2224,85 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
     })));return [...map.values()].sort((a,b)=>a.f-b.f);}
   const plNegTan=tn=>{if(!tn||typeof tn!=='object')return tn;const o=Object.assign({},tn);
     if(plFinite(o.inTangent))o.inTangent=-o.inTangent;if(plFinite(o.outTangent))o.outTangent=-o.outTangent;return o;};
-  function plWrap(v,fallback='Clamp'){return typeof v==='string'&&v?v:fallback;}
-  function plMakeTrack(t,fps,targetKind){const rows=plKeyMap(t,fps),keys=rows.map(r=>{const k={t:r.t0!=null?r.t0:+(r.f/fps).toFixed(7)};
+  // 保存の最終フレーム（全クリップの末尾のうち最大）
+  function plMaxFrame(){let m=0;tl.tracks.forEach(t=>t.clips.forEach(c=>m=Math.max(m,c.start+Math.max(0,c.len-1))));return m;}
+  // キーをそのまま書くと再生（Track.sample）と一致しないトラックか。
+  // キーを持つクリップが 2 本以上（再生はクリップごとのキーで評価し、保存は全クリップのキーを 1 列にするため、
+  // 前後キーで傾きを求める Auto 等の接線とループの周期が変わる）、または重み 1 未満のクリップがある（再生は評価後に重みを掛ける）。
+  // 1 クリップ・重み 1 なら、ループでも再生（Clip.sampleChannel）と保存は同じキー列・同じラップで評価されるので一致する。
+  // キーを持つクリップがレイヤー（layer を持つバンドルとその下）に属するトラックも、再生はレイヤーを合成するので標本化する。
+  function plNeedsBake(t){const cs=t.clips.filter(c=>t.channels.some(ch=>(c.keys[ch.name]||[]).length));
+    const info=layerInfo(tl);
+    return cs.length>=2||cs.some(c=>c.weight<1)||!!(info&&cs.some(c=>info.clipLayer.get(c.id)));}
+  // 再生の評価をフレーム 0〜maxF で標本化したキー（接線・t0 なし、時刻は f/fps）。キーのあるチャンネルだけ書く
+  function plBakeKeys(t,fps,maxF){const has=new Set(t.channels.filter(ch=>t.clips.some(c=>(c.keys[ch.name]||[]).length)).map(ch=>ch.name)),keys=[];
+    for(let f=0;f<=maxF;f++){const s=t.sample(f),k={t:+(f/fps).toFixed(7)};
+      if(has.has('pos')){const v=plVec(s.pos,3);if(v)k.pos=v;}
+      if(has.has('rot')){const q=plVec(s.rot,4);if(q)k.rot=Q.norm(q);}
+      if(has.has('scl')){const v=plVec(s.scl,3);if(v)k.scl=v;}
+      if(has.has('w')&&plFinite(s.w))k.v=+s.w;
+      keys.push(k);}
+    return keys;}
+  function plMakeTrack(t,fps,targetKind,maxF){const bake=plNeedsBake(t);
+    const keys=bake?plBakeKeys(t,fps,maxF==null?plMaxFrame():maxF):plKeyMap(t,fps).map(r=>{const k={t:r.t0!=null?r.t0:+(r.f/fps).toFixed(7)};
       if(r.pos)k.pos=r.pos;if(r.rot)k.rot=r.rot;if(r.scl)k.scl=r.scl;if(plFinite(r.v))k.v=r.v;
       if(r.posTan)k.posTan=r.posTan;if(r.rotTan)k.rotTan=r.rotTan;if(r.sclTan)k.sclTan=r.sclTan;if(r.tan)k.tan=r.tan;return k;});
     // 回転の半球をそろえる。符号を反転したキーは rotTan の傾きも反転する（重みとモードはそのまま）
     let prev=null;keys.forEach(k=>{if(!k.rot)return;if(prev&&prev[0]*k.rot[0]+prev[1]*k.rot[1]+prev[2]*k.rot[2]+prev[3]*k.rot[3]<0){
       k.rot=k.rot.map(v=>-v);if(Array.isArray(k.rotTan))k.rotTan=k.rotTan.map(plNegTan);}prev=k.rot;});
+    // 再生の評価（Clip.sampleChannel・Track.sampleContinuous）と同じ値。標本化したトラックは全フレームにキーがあるので Clamp
+    const wrap=bake?{pre:'Clamp',post:'Clamp'}:trackWrap(t);
     return{id:String((targetKind==='humanoid'&&t.uname)||t.name||t.id),targetKind,
-      preWrapMode:plWrap(t.preWrapMode),postWrapMode:plWrap(t.postWrapMode,t.clips.some(c=>c.loop)?'Loop':'Clamp'),keys};}
-  // bakedBones（ボーン型で骨のトラック）の中身の控え。読込時と保存時で比べる
-  function plBakedSig(){const fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30;
+      preWrapMode:wrap.pre,postWrapMode:wrap.post,keys};}
+  // bakedBones（ボーン型で骨のトラック）の中身の控え。読込時と保存時で比べる。
+  // 保存と同じ plMakeTrack で作るので、重みやクリップだけ変えたトラックも標本化した値の差として現れる
+  function plBakedSig(){const fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30,maxF=plMaxFrame();
     return JSON.stringify(tl.tracks.filter(t=>t.type==='bone'&&!isAuxTrack(t)&&(t.plRole==='bakedBones'||(!t.plRole&&t.uname)))
-      .map(t=>plMakeTrack(t,fps,'humanoid')).sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0));}
+      .map(t=>plMakeTrack(t,fps,'humanoid',maxF)).sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0));}
   let plLastDropped=false;   // 直前の exportPolyLing で muscles と body を書かなかったか
+  // edit のトラック（平らなトラック d を書いた Studio のトラック t。表示だけの欄と null の欄は書かない）
+  function plEditTrack(t,role,kind,target){const o={id:String(t.id),role};if(kind)o.targetKind=kind;o.target=String(target);
+    o.name=String(t.name!=null?t.name:target);if(t.uname)o.uname=String(t.uname);
+    if(t.plCategory)o.category=t.plCategory;if(t.plProvider)o.provider=t.plProvider;
+    if(t.preWrapMode)o.preWrapMode=t.preWrapMode;if(t.postWrapMode)o.postWrapMode=t.postWrapMode;
+    o.clips=t.clips.map(c=>{const oc={id:String(c.id),name:c.name,start:c.start,len:c.len,loop:!!c.loop,weight:c.weight};
+      t.channels.forEach(ch=>{const a=c.keys[ch.name]||[];if(!a.length)return;oc[ch.name]=a.map(k=>{
+        const y={f:k.f,v:Array.isArray(k.v)?k.v.slice():k.v};if(k.tan!=null)y.tan=plClone(k.tan);if(plFinite(k.t0))y.t0=+k.t0;return y;});});
+      return oc;});
+    return o;}
   function exportPolyLing(){const meta=tl.plMotion||{},fps=plFinite(tl.fps)&&+tl.fps>0?+tl.fps:30;
-    const out={format:'PolyLingMotion',version:4,name:String(meta.name||'Motion'),frameRate:fps,duration:0,
+    const out={format:'PolyLingMotion',version:5,name:String(meta.name||'Motion'),frameRate:fps,duration:0,
       space:meta.space||'local',loop:!!meta.loop,bones:[],expressions:[],muscles:[],body:null,bakedBones:[],
       metadata:plClone(meta.metadata||{createdWith:'Motion Studio'})};
     if(meta.absentMuscles==='zero'||meta.absentMuscles==='rest')out.absentMuscles=meta.absentMuscles;
-    let maxF=0;tl.tracks.forEach(t=>t.clips.forEach(c=>maxF=Math.max(maxF,c.start+Math.max(0,c.len-1))));
+    const maxF=plMaxFrame(),et=[];   // et: edit のトラック（平らなトラックを書いたものだけ）
     tl.tracks.forEach(t=>{let role=t.plRole;if(!role)role=t.type==='morph'?'expressions':t.type==='muscle'?'muscles':t.uname?'bakedBones':'bones';
-      if(t.type==='morph'||role==='expressions'){const d=plMakeTrack(t,fps,'scalar');delete d.id;delete d.targetKind;d.name=String(t.name||t.id);
-        if(t.plCategory)d.category=t.plCategory;if(t.plProvider)d.provider=t.plProvider;out.expressions.push(d);return;}
-      if(t.type==='muscle'||role==='muscles'){const d=plMakeTrack(t,fps,'scalar');delete d.id;delete d.targetKind;d.name=String(t.name||t.id);out.muscles.push(d);return;}
-      if(role==='body'){if(out.body)return;const d=plMakeTrack(t,fps,'body');d.id='body';out.body=d;return;}   // 腰（RootT / RootQ）
-      if(role==='lookAt'){if(out.lookAt)return;const d=plMakeTrack(t,fps,'lookAt');d.id='lookAt';   // 視線は回転だけ
-        d.keys=d.keys.filter(k=>{delete k.pos;delete k.posTan;delete k.scl;delete k.sclTan;return !!k.rot;});out.lookAt=d;return;}
+      if(t.type==='morph'||role==='expressions'){const d=plMakeTrack(t,fps,'scalar',maxF);delete d.id;delete d.targetKind;d.name=String(t.name||t.id);
+        if(t.plCategory)d.category=t.plCategory;if(t.plProvider)d.provider=t.plProvider;out.expressions.push(d);et.push(plEditTrack(t,'expressions',null,d.name));return;}
+      if(t.type==='muscle'||role==='muscles'){const d=plMakeTrack(t,fps,'scalar',maxF);delete d.id;delete d.targetKind;d.name=String(t.name||t.id);out.muscles.push(d);
+        et.push(plEditTrack(t,'muscles',null,d.name));return;}
+      if(role==='body'){if(out.body)return;const d=plMakeTrack(t,fps,'body',maxF);d.id='body';out.body=d;et.push(plEditTrack(t,'body','body','body'));return;}   // 腰（RootT / RootQ）
+      if(role==='lookAt'){if(out.lookAt)return;const d=plMakeTrack(t,fps,'lookAt',maxF);d.id='lookAt';   // 視線は回転だけ
+        d.keys=d.keys.filter(k=>{delete k.pos;delete k.posTan;delete k.scl;delete k.sclTan;return !!k.rot;});out.lookAt=d;et.push(plEditTrack(t,'lookAt','lookAt','lookAt'));return;}
       const allowed=new Set(['boneName','path','humanoid']);let kind=t.plTargetKind||(role==='bakedBones'?'humanoid':'boneName');if(!allowed.has(kind))kind='boneName';
-      if(role==='bones'&&kind==='humanoid')kind='boneName';const d=plMakeTrack(t,fps,kind);
+      if(role==='bones'&&kind==='humanoid')kind='boneName';const d=plMakeTrack(t,fps,kind,maxF);
       if(role==='bakedBones'||kind==='humanoid'){   // 正準骨格は骨の長さを持たないので、Hips の pos と回転だけ書く
         d.keys=d.keys.filter(k=>{delete k.scl;delete k.sclTan;if(d.id!=='Hips'){delete k.pos;delete k.posTan;}return !!(k.rot||k.pos);});
-        if(d.keys.length)out.bakedBones.push(d);}
-      else out.bones.push(d);
+        if(d.keys.length){out.bakedBones.push(d);et.push(plEditTrack(t,'bakedBones','humanoid',d.id));}}
+      else{out.bones.push(d);et.push(plEditTrack(t,'bones',kind,d.id));}
     });
     const ofs=plVec(meta.lookAtOffsetFromHeadBone,3);if(ofs)out.lookAtOffsetFromHeadBone=ofs;
     // muscles と bakedBones が食い違うときは muscles と body を書かない（PolyLing が bakedBones から焼き直す）
     plLastDropped=false;
     if((out.muscles.length||out.body)&&out.bakedBones.length&&meta.bakedSig!=null&&plBakedSig()!==meta.bakedSig){out.muscles=[];out.body=null;plLastDropped=true;}
+    // edit：平らなトラックを書かなかったトラックは入れず、そのクリップはバンドルの clipIds から除く
+    const tracks=et.filter(o=>!(plLastDropped&&(o.role==='muscles'||o.role==='body')));
+    const clipSet=new Set();tracks.forEach(o=>o.clips.forEach(c=>clipSet.add(c.id)));
+    out.edit={tracks,bundles:tl.bundles.map(b=>{const o={id:String(b.id),name:b.name,clipIds:b.clipIds.map(String).filter(id=>clipSet.has(id)),
+      childIds:b.childIds.map(String)};if(b.parentId)o.parentId=String(b.parentId);if(b.layer)o.layer={...b.layer};return o;})};
     // 長さが読み込んだときのまま（フレームに直して同じ）なら、元の秒をそのまま書く
     const d0=meta.duration;out.duration=(plFinite(d0)&&Math.round(+d0*fps)===maxF)?+d0:+(maxF/fps).toFixed(7);return out;}
-  function plSaveToast(data){toast(`PolyLing v4 保存: ${data.bones.length+data.bakedBones.length}ボーン / ${data.expressions.length}表情 / ${data.muscles.length}マッスル`
+  function plSaveToast(data){toast(`PolyLing v5 保存: ${data.bones.length+data.bakedBones.length}ボーン / ${data.expressions.length}表情 / ${data.muscles.length}マッスル`
     +(plLastDropped?'（bakedBones を変えたのでマッスルと body は書かず。PolyLing が読むときに bakedBones から作り直します）':''));}
   function downloadPolyLing(){const data=exportPolyLing(),safe=(data.name||'motion').replace(/[\\/:*?"<>|]+/g,'_');
     const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json;charset=utf-8'}),a=document.createElement('a');
@@ -1929,6 +2338,8 @@ resize();refresh();view.ppf=M.clamp((W-20)/Math.max(60,tl.length),0.6,60);refres
     nativeSend(payload);
     parent.postMessage({app:'MotionStudio',from:'timeline',payload}, '*');
   };
+  // 軌跡（pathData / pathTarget）は外側へだけ送る（外側がボーン編集へ中継する）
+  if(window.parent!==window) pathSink = payload => parent.postMessage({app:'MotionStudio',from:'timeline',payload}, '*');
   function state(){
     return {frame:Math.round(playhead),playing,selection:selectionSummary(),bones:selectedBoneIds(),canUndo:window.tlUndo.canUndo,canRedo:window.tlUndo.canRedo};
   }
